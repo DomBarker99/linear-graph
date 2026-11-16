@@ -90,11 +90,16 @@
   }
   .chip:hover { background: color-mix(in srgb, var(--ready) 15%, transparent); }
   .warning { color: var(--blocked); }
-  .legend { margin-left: auto; display: flex; gap: 14px; }
-  .legend span::before {
-    content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px;
+  /* The legend is also the set of switches that collapse a status into dots. */
+  .legend { margin-left: auto; display: flex; gap: 6px; }
+  .toggle { padding: 2px 9px; border: 1px solid var(--line); border-radius: 10px; background: none; color: var(--text); }
+  .toggle:hover { border-color: var(--muted); }
+  .toggle::before {
+    content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: -1px;
     background: var(--swatch);
   }
+  .toggle.off { border-style: dashed; color: var(--muted); }
+  .toggle.off::before { width: 8px; height: 8px; border-radius: 50%; vertical-align: 0; }
 
   #body { flex: 1; display: flex; min-height: 0; }
   /* The stage is a window onto the sheet (#canvas), which app.js moves and scales. */
@@ -103,7 +108,7 @@
     user-select: none; -webkit-user-select: none;
     background-image: radial-gradient(circle, var(--line) 1px, transparent 1.5px);
   }
-  #stage.dragging, #stage.dragging .card { cursor: grabbing; }
+  #stage.dragging, #stage.dragging .card, #stage.dragging .pin { cursor: grabbing; }
   #canvas { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
   #canvas.gliding { transition: transform .25s ease; }
   .controls {
@@ -151,7 +156,17 @@
   .card.blocked { --accent: var(--blocked); border-left-color: var(--blocked); }
   .card.done .title { color: var(--muted); text-decoration: line-through; }
   .card.selected { outline: 2px solid var(--select); outline-offset: 1px; }
-  #cards.focused .card:not(.lit) { opacity: .28; }
+  #cards.focused .card:not(.lit), #cards.focused .pin:not(.lit) { opacity: .28; }
+  /* A collapsed issue. */
+  .pin {
+    position: absolute; padding: 0; border: 2px solid var(--bg); border-radius: 50%; background: var(--todo);
+  }
+  .pin.ready { background: var(--ready); }
+  .pin.started { background: var(--started); }
+  .pin.blocked { background: var(--blocked); }
+  .pin.done { background: var(--done); }
+  .pin:hover { transform: scale(1.3); }
+  .pin.selected { outline: 2px solid var(--select); outline-offset: 2px; }
   .card .top, .card .bottom { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
   .card .id { color: var(--muted); font-size: 11px; }
   .card .state { font-size: 11px; color: var(--accent, var(--muted)); white-space: nowrap; }

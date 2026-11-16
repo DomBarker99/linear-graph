@@ -224,6 +224,62 @@ test("a relation list that was cut short is reported", () => {
   assert.match(buildGraph([cut, issue(2)]).warnings.join(" "), /T-1 has more relations/);
 });
 
+test("every issue gets one status, and a collapsed status turns its issues into dots", () => {
+  const issues = [
+    issue(1, { state: "completed", blocks: [3] }),
+    issue(2, { state: "completed", blocks: [3] }),
+    issue(3, { blocks: [4] }),
+    issue(4, { state: "started" }),
+    issue(5, { state: "started" }),
+  ];
+  const open = buildGraph(issues);
+  assert.deepEqual(
+    open.nodes.map((entry) => entry.status),
+    ["done", "done", "ready", "blocked", "started"],
+  );
+  assert.ok(open.nodes.every((entry) => !entry.collapsed));
+
+  const folded = buildGraph(issues, { collapse: ["done", "started"] });
+  assert.deepEqual(
+    folded.nodes.map((entry) => entry.collapsed),
+    [true, true, false, false, true],
+  );
+  // Collapsing changes how things are drawn, not what they are or where the lines go.
+  assert.deepEqual(
+    folded.nodes.map((entry) => [entry.id, entry.status, entry.col]),
+    open.nodes.map((entry) => [entry.id, entry.status, entry.col]),
+  );
+  assert.deepEqual(
+    folded.edges.map((edge) => `${edge.from}>${edge.to}`),
+    open.edges.map((edge) => `${edge.from}>${edge.to}`),
+  );
+});
+
+test("dots take less room than cards, and still never overlap", () => {
+  const issues = [
+    issue(1, { state: "completed", blocks: [5] }),
+    issue(2, { state: "completed", blocks: [5] }),
+    issue(3, { state: "completed", blocks: [5] }),
+    issue(4, { blocks: [5] }),
+    issue(5),
+  ];
+  const gaps = (graph: Graph): number[] => {
+    const column = graph.nodes.filter((entry) => entry.col === 0).sort((a, b) => a.y - b.y);
+    return column.slice(1).map((entry, index) => +(entry.y - column[index].y).toFixed(2));
+  };
+  const open = buildGraph(issues);
+  const folded = buildGraph(issues, { collapse: ["done"] });
+  assert.ok(gaps(open).every((gap) => gap >= 1));
+  assert.ok(folded.height < open.height, "the collapsed graph is shorter");
+  const column = folded.nodes.filter((entry) => entry.col === 0).sort((a, b) => a.y - b.y);
+  for (let index = 1; index < column.length; index++) {
+    const both = column[index].collapsed && column[index - 1].collapsed;
+    const either = column[index].collapsed || column[index - 1].collapsed;
+    const least = both ? 0.3 : either ? 0.65 : 1;
+    assert.ok(column[index].y - column[index - 1].y >= least, `${column[index - 1].id} and ${column[index].id} keep apart`);
+  }
+});
+
 // --- Reading Linear ------------------------------------------------------------
 
 type Call = { url: string; method: string; headers: Record<string, string>; body: { query: string; variables: Record<string, unknown> } };
@@ -454,6 +510,32 @@ test("POST /api/refresh reads the source again, but not twice within a few secon
     assert.equal(tooSoon.throttled, true);
     assert.equal(tooSoon.nodes.length, 2);
     assert.equal(app.reads(), 2);
+  } finally {
+    await app.close();
+  }
+});
+
+test("?collapse= picks the statuses drawn as dots, ignores anything else, and does not re-read Linear", async () => {
+  const app = await start(() => [issue(1, { state: "completed", blocks: [2] }), issue(2)]);
+  try {
+    const plain = await (await fetch(`${app.url}/api/graph`)).json();
+    assert.deepEqual(plain.collapsed, []);
+    assert.ok(plain.nodes.every((entry: GraphNode) => !entry.collapsed));
+
+    const folded = await (await fetch(`${app.url}/api/graph?collapse=done,nonsense,__proto__`)).json();
+    assert.deepEqual(folded.collapsed, ["done"]);
+    assert.deepEqual(
+      folded.nodes.map((entry: GraphNode) => [entry.id, entry.collapsed]),
+      [
+        ["T-1", true],
+        ["T-2", false],
+      ],
+    );
+
+    const refreshed = await (await fetch(`${app.url}/api/refresh?collapse=ready`, { method: "POST" })).json();
+    assert.deepEqual(refreshed.collapsed, ["ready"]);
+    assert.equal(refreshed.throttled, true);
+    assert.equal(app.reads(), 1);
   } finally {
     await app.close();
   }

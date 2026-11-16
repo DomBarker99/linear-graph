@@ -1,14 +1,17 @@
 // The page. Asks the server for the graph (GET /api/graph) and draws it:
 // cards are HTML, the lines between them are one SVG underneath.
 // The graph is one sheet that can be dragged around and zoomed, with a small
-// map of the whole thing in the corner.
+// map of the whole thing in the corner. Each status in the legend can be
+// collapsed, which draws its issues as dots instead of cards.
 // The server has already decided each card's column and height; this file only
 // turns those into pixels. Everything from Linear is put on the page as text,
 // never as HTML.
 
 const CARD_W = 232;
 const CARD_H = 90;
-const COL_PITCH = 296; // left edge of one column to the left edge of the next
+const COL_GAP = 64; // room between two columns, where the lines bend
+const DOT_COL = 40; // width of a column that holds only dots
+const DOT_R = 9; // radius of a collapsed issue's dot
 const ROW_PITCH = 100; // pixels per unit of the server's y
 const PAD = 24;
 const MIN_ZOOM = 0.2;
@@ -22,6 +25,8 @@ const POLL_MS = 60_000;
 
 const MILESTONE_COLOURS = ["#7c9cff", "#c58af9", "#4fc3c8", "#f28b82", "#d4c15a", "#8bc34a", "#ff9e64", "#90a4ae"];
 const PRIORITIES = ["None", "Urgent", "High", "Medium", "Low"];
+const STATUSES = { ready: "Ready", started: "In progress", blocked: "Blocked", done: "Done" };
+const STORE_KEY = "linear-graph.collapsed";
 const SVG = "http://www.w3.org/2000/svg";
 
 const $ = (id) => document.getElementById(id);
@@ -54,6 +59,28 @@ const viewport = { x: 0, y: 0, k: 1 };
 let fitted = true;
 // Size of the whole sheet at full size.
 const world = { width: 0, height: 0 };
+// Where each column starts and how wide it is. A column with only dots in it is narrow.
+let columns = [];
+// The statuses drawn as dots. Remembered in this browser.
+const collapsed = new Set(readCollapsed());
+
+function readCollapsed() {
+  try {
+    return JSON.parse(localStorage.getItem(STORE_KEY) ?? "[]").filter((status) => status in STATUSES);
+  } catch {
+    return [];
+  }
+}
+
+function toggleCollapsed(status) {
+  if (!collapsed.delete(status)) collapsed.add(status);
+  try {
+    localStorage.setItem(STORE_KEY, JSON.stringify([...collapsed]));
+  } catch {
+    // Private windows may refuse; the choice then lasts until the page is closed.
+  }
+  load();
+}
 
 /** Make an element. props: class, text, title, and any other attribute. */
 function el(tag, props = {}, children = []) {
@@ -103,7 +130,9 @@ function ago(iso) {
 
 async function load(refresh = false) {
   try {
-    const response = await fetch(refresh ? "/api/refresh" : "/api/graph", { method: refresh ? "POST" : "GET" });
+    // The server lays the graph out, so it has to know which statuses are dots.
+    const query = collapsed.size ? `?collapse=${[...collapsed].join(",")}` : "";
+    const response = await fetch((refresh ? "/api/refresh" : "/api/graph") + query, { method: refresh ? "POST" : "GET" });
     const body = await response.json();
     if (!response.ok) throw new Error(body.error ?? `HTTP ${response.status}`);
     graph = body;
@@ -129,15 +158,32 @@ function showSync() {
 
 // --- Drawing ---------------------------------------------------------------
 
-const nodeX = (col) => PAD + col * COL_PITCH;
 const nodeTop = (y) => PAD + y * ROW_PITCH;
 const nodeMid = (y) => nodeTop(y) + CARD_H / 2;
 
+/** Work out where each column sits. Returns the width of the whole sheet. */
+function layoutColumns() {
+  columns = [];
+  let x = PAD;
+  for (let col = 0; col < graph.columns; col++) {
+    const hasCard = graph.nodes.some((node) => node.col === col && !node.collapsed);
+    const width = hasCard ? CARD_W : DOT_COL;
+    columns.push({ x, width });
+    x += width + COL_GAP;
+  }
+  return Math.max(PAD * 2, x - COL_GAP + PAD);
+}
+
+/** Where an issue is drawn: left and right are where its lines attach, cx and mid its centre. */
+function box(node) {
+  const column = columns[node.col];
+  const cx = column.x + column.width / 2;
+  const mid = nodeMid(node.y);
+  return node.collapsed ? { left: cx - DOT_R, right: cx + DOT_R, cx, mid } : { left: column.x, right: column.x + column.width, cx, mid };
+}
+
 function statusClass(node) {
-  if (node.done) return "done";
-  if (node.blocked) return "blocked";
-  if (node.state.type === "started") return "started";
-  return node.ready ? "ready" : "";
+  return node.status;
 }
 
 function statusText(node) {
@@ -214,13 +260,26 @@ function drawNotes() {
     }
   }
   for (const warning of graph.warnings) parts.push(el("span", { class: "warning", text: warning }));
+  // The legend doubles as the switches: click a status to collapse its issues into dots.
   parts.push(
-    el("span", { class: "legend" }, [
-      el("span", { text: "Ready", style: "--swatch:var(--ready)" }),
-      el("span", { text: "In progress", style: "--swatch:var(--started)" }),
-      el("span", { text: "Blocked", style: "--swatch:var(--blocked)" }),
-      el("span", { text: "Done", style: "--swatch:var(--done)" }),
-    ]),
+    el(
+      "span",
+      { class: "legend" },
+      Object.entries(STATUSES).map(([status, name]) => {
+        const off = collapsed.has(status);
+        const count = graph.nodes.filter((node) => node.status === status).length;
+        const toggle = el("button", {
+          class: off ? "toggle off" : "toggle",
+          type: "button",
+          style: `--swatch:var(--${status})`,
+          "aria-pressed": String(!off),
+          title: off ? `${name}: shown as dots. Click to show the cards.` : `${name}: click to collapse into dots.`,
+          text: `${name} ${count}`,
+        });
+        toggle.addEventListener("click", () => toggleCollapsed(status));
+        return toggle;
+      }),
+    ),
   );
   view.notes.replaceChildren(...parts);
 }
@@ -251,7 +310,7 @@ function chainOf(id) {
 }
 
 function drawGraph() {
-  const width = PAD * 2 + Math.max(0, graph.columns - 1) * COL_PITCH + CARD_W;
+  const width = layoutColumns();
   const height = PAD * 2 + Math.max(0, graph.height - 1) * ROW_PITCH + CARD_H;
   view.canvas.style.width = `${width}px`;
   view.canvas.style.height = `${height}px`;
@@ -289,9 +348,29 @@ function drawGraph() {
 
   view.cards.replaceChildren(
     ...graph.nodes.map((node) => {
-      const classes = ["card", statusClass(node)];
+      const classes = [node.collapsed ? "pin" : "card", statusClass(node)];
       if (node.id === selected) classes.push("selected");
       if (lit(node.id)) classes.push("lit");
+      const pick = (event) => {
+        event.stopPropagation();
+        select(node.id === selected ? null : node.id);
+      };
+      if (node.collapsed) {
+        // A collapsed issue: a dot that still carries its lines, its name on hover, and opens the panel.
+        const place = box(node);
+        const pin = el("button", {
+          class: classes.join(" "),
+          type: "button",
+          "data-id": node.id,
+          title: `${node.id} · ${node.title} (${statusText(node)})`,
+          "aria-label": `${node.id} ${node.title}`,
+        });
+        pin.style.left = `${place.cx - DOT_R}px`;
+        pin.style.top = `${place.mid - DOT_R}px`;
+        pin.style.width = pin.style.height = `${DOT_R * 2}px`;
+        pin.addEventListener("click", pick);
+        return pin;
+      }
       const due = node.dueDate
         ? el("span", { class: !node.done && isPast(node.dueDate) ? "due overdue" : "due", text: shortDay(node.dueDate) })
         : el("span", { class: "due" });
@@ -309,14 +388,11 @@ function drawGraph() {
           due,
         ]),
       ]);
-      card.style.left = `${nodeX(node.col)}px`;
+      card.style.left = `${columns[node.col].x}px`;
       card.style.top = `${nodeTop(node.y)}px`;
       card.style.width = `${CARD_W}px`;
       card.style.height = `${CARD_H}px`;
-      card.addEventListener("click", (event) => {
-        event.stopPropagation();
-        select(node.id === selected ? null : node.id);
-      });
+      card.addEventListener("click", pick);
       return card;
     }),
   );
@@ -327,24 +403,25 @@ function route(edge) {
   const points = edge.points;
   const last = points.length - 1;
   const backwards = points[last][0] <= points[0][0]; // only a loop edge can point left
-  let fromX = nodeX(points[0][0]) + CARD_W;
-  let fromY = nodeMid(points[0][1]);
+  const source = box(byId(edge.from));
+  const target = box(byId(edge.to));
+  let fromX = source.right;
+  let fromY = source.mid;
   let path = `M${fromX},${fromY}`;
   for (let index = 1; index <= last; index++) {
-    const toX = nodeX(points[index][0]);
-    const toY = nodeMid(points[index][1]);
+    const column = columns[points[index][0]];
+    const toX = index === last ? target.left : column.x;
+    const toY = index === last ? target.mid : nodeMid(points[index][1]);
     const bend = backwards ? 120 : (toX - fromX) / 2;
     path += ` C${fromX + bend},${fromY} ${toX - bend},${toY} ${toX},${toY}`;
     if (index < last) {
       // Straight through the column the line is passing.
-      fromX = toX + CARD_W;
+      fromX = column.x + column.width;
       fromY = toY;
       path += ` L${fromX},${fromY}`;
     }
   }
-  const tipX = nodeX(points[last][0]);
-  const tipY = nodeMid(points[last][1]);
-  return { path, head: `M${tipX},${tipY} l-8,-4.5 v9 z` };
+  return { path, head: `M${target.left},${target.mid} l-8,-4.5 v9 z` };
 }
 
 // --- Moving around -----------------------------------------------------------
@@ -390,8 +467,9 @@ function fit(animate = true) {
 /** Glide so that this issue's card is in the middle of the stage. */
 function centreOn(id) {
   const node = byId(id);
-  viewport.x = view.stage.clientWidth / 2 - (nodeX(node.col) + CARD_W / 2) * viewport.k;
-  viewport.y = view.stage.clientHeight / 2 - nodeMid(node.y) * viewport.k;
+  const place = box(node);
+  viewport.x = view.stage.clientWidth / 2 - place.cx * viewport.k;
+  viewport.y = view.stage.clientHeight / 2 - place.mid * viewport.k;
   fitted = false;
   applyViewport(true);
 }
@@ -404,16 +482,19 @@ function drawMinimap() {
   view.minimap.setAttribute("height", world.height * scale);
   view.minimap.style.display = graph.nodes.length ? "" : "none";
   view.mapNodes.replaceChildren(
-    ...graph.nodes.map((node) =>
-      svg("rect", {
+    ...graph.nodes.map((node) => {
+      const place = box(node);
+      // On the map a dot is drawn larger than life, or it would vanish.
+      const half = node.collapsed ? 26 : CARD_H / 2;
+      return svg("rect", {
         class: `${statusClass(node)}${node.id === selected ? " selected" : ""}`,
-        x: nodeX(node.col),
-        y: nodeTop(node.y),
-        width: CARD_W,
-        height: CARD_H,
-        rx: 14,
-      }),
-    ),
+        x: node.collapsed ? place.cx - half : place.left,
+        y: place.mid - half,
+        width: node.collapsed ? half * 2 : place.right - place.left,
+        height: half * 2,
+        rx: node.collapsed ? half : 14,
+      });
+    }),
   );
 }
 
@@ -554,7 +635,7 @@ view.stage.addEventListener(
   { passive: false },
 );
 view.stage.addEventListener("dblclick", (event) => {
-  if (event.target.closest(".card, .controls, #minimap")) return;
+  if (event.target.closest(".card, .pin, .controls, #minimap")) return;
   const box = view.stage.getBoundingClientRect();
   zoomAt(event.clientX - box.left, event.clientY - box.top, viewport.k * 1.6, true);
 });

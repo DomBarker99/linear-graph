@@ -7,6 +7,7 @@
 //
 //   GET  /              the page (public/index.html, public/app.js)
 //   GET  /api/graph     the graph as JSON; re-reads Linear when the copy is old
+//                       ?collapse=done,blocked draws those issues as dots instead of cards
 //   POST /api/refresh   re-read Linear now (at most once every few seconds)
 //   GET  /healthz       "ok"
 //
@@ -166,9 +167,17 @@ export type GraphNode = {
   blocked: boolean;
   /** Not started, and nothing open blocks it. */
   ready: boolean;
+  /** The one word the page colours by: done, blocked, started or ready. */
+  status: Status;
+  /** Drawn as a dot instead of a card, because its status was asked to be collapsed. */
+  collapsed: boolean;
   blockedBy: string[];
   blocks: string[];
 };
+
+/** Every issue has exactly one of these. Blocked wins over started: work under way that is still waiting counts as blocked. */
+export const STATUSES = ["ready", "started", "blocked", "done"] as const;
+export type Status = (typeof STATUSES)[number];
 
 export type GraphEdge = {
   /** The blocking issue. */
@@ -206,8 +215,10 @@ const NO_MILESTONE = "none";
 
 // Vertical room each thing takes, in card heights. A long edge passing through
 // a column takes a thin slot, so cards are never drawn on top of a line.
+// An issue collapsed to a dot takes the same thin slot as a line.
 const CARD_SLOT = 1;
 const LINE_SLOT = 0.3;
+const DOT_SLOT = 0.3;
 const SLOT_GAP = 0.08;
 
 /** "CS1-9" sorts before "CS1-14". */
@@ -248,7 +259,8 @@ function nonDecreasingFit(values: number[]): number[] {
 }
 
 /** Turn Linear's issues into nodes with positions, edges, and progress counts. */
-export function buildGraph(issues: LinearIssue[]): Graph {
+export function buildGraph(issues: LinearIssue[], options: { collapse?: Iterable<Status> } = {}): Graph {
+  const collapse = new Set(options.collapse ?? []);
   const warnings: string[] = [];
   // Cancelled and duplicate issues are left out: they are neither work to do nor work done.
   const kept = issues
@@ -318,8 +330,15 @@ export function buildGraph(issues: LinearIssue[]): Graph {
   }
   const columns = ids.length === 0 ? 0 : Math.max(...col.values()) + 1;
 
-  // --- Slots: every column holds cards, plus a thin slot for each line passing through
-  type Slot = { key: string; card: boolean };
+  // --- Status of each issue, and which ones are collapsed to a dot ---------
+  const isDone = (id: string): boolean => issueOf.get(id)!.state.type === "completed";
+  const isBlocked = (id: string): boolean => !isDone(id) && blockedBy.get(id)!.some((prev) => !isDone(prev));
+  const statusOf = (id: string): Status =>
+    isDone(id) ? "done" : isBlocked(id) ? "blocked" : issueOf.get(id)!.state.type === "started" ? "started" : "ready";
+  const isCollapsed = (id: string): boolean => collapse.has(statusOf(id));
+
+  // --- Slots: every column holds cards or dots, plus a thin slot for each line passing through
+  type Slot = { key: string; room: number };
   const layers: Slot[][] = Array.from({ length: columns }, () => []);
   const left = new Map<string, string[]>(); // slot -> slots it connects to in the column before
   const right = new Map<string, string[]>(); // slot -> slots it connects to in the column after
@@ -329,7 +348,7 @@ export function buildGraph(issues: LinearIssue[]): Graph {
   };
   const milestoneOrder = (id: string): number => issueOf.get(id)!.projectMilestone?.sortOrder ?? Number.MAX_VALUE;
   for (const id of [...ids].sort((a, b) => milestoneOrder(a) - milestoneOrder(b) || compareIdentifiers(a, b))) {
-    layers[col.get(id)!].push({ key: id, card: true });
+    layers[col.get(id)!].push({ key: id, room: isCollapsed(id) ? DOT_SLOT : CARD_SLOT });
   }
   const passes = new Map<string, string[]>(); // edge -> the thin slots it passes through
   for (const from of ids) {
@@ -338,7 +357,7 @@ export function buildGraph(issues: LinearIssue[]): Graph {
       let previous = from;
       for (let column = col.get(from)! + 1; column < col.get(to)!; column++) {
         const key = `${from}>${to}@${column}`;
-        layers[column].push({ key, card: false });
+        layers[column].push({ key, room: LINE_SLOT });
         connect(previous, key);
         through.push(key);
         previous = key;
@@ -423,8 +442,7 @@ export function buildGraph(issues: LinearIssue[]): Graph {
   const offsets = layers.map((layer) => {
     const offset = [0];
     for (let index = 1; index < layer.length; index++) {
-      const room = (slot: Slot): number => (slot.card ? CARD_SLOT : LINE_SLOT);
-      offset.push(offset[index - 1] + (room(layer[index - 1]) + room(layer[index])) / 2 + SLOT_GAP);
+      offset.push(offset[index - 1] + (layer[index - 1].room + layer[index].room) / 2 + SLOT_GAP);
     }
     return offset;
   });
@@ -462,11 +480,9 @@ export function buildGraph(issues: LinearIssue[]): Graph {
   const height = ids.length === 0 ? 0 : round2(Math.max(...layers.flat().map((slot) => y.get(slot.key)!)) + 1);
 
   // --- Nodes -------------------------------------------------------------
-  const isDone = (id: string): boolean => issueOf.get(id)!.state.type === "completed";
   const nodes: GraphNode[] = kept.map((issue) => {
     const id = issue.identifier;
-    const done = isDone(id);
-    const blocked = !done && blockedBy.get(id)!.some((prev) => !isDone(prev));
+    const status = statusOf(id);
     return {
       id,
       title: issue.title,
@@ -478,9 +494,11 @@ export function buildGraph(issues: LinearIssue[]): Graph {
       milestone: issue.projectMilestone?.id ?? NO_MILESTONE,
       col: col.get(id)!,
       y: y.get(id)!,
-      done,
-      blocked,
-      ready: !done && !blocked && issue.state.type !== "started",
+      done: status === "done",
+      blocked: status === "blocked",
+      ready: status === "ready",
+      status,
+      collapsed: collapse.has(status),
       blockedBy: blockedBy.get(id)!,
       blocks: blocks.get(id)!,
     };
@@ -596,7 +614,8 @@ export function createApp(options: AppOptions): Server {
     ["/app.js", { type: "text/javascript; charset=utf-8", body: script }],
   ]);
 
-  let graph: Graph | null = null;
+  let issues: LinearIssue[] | null = null; // the last good read
+  const graphs = new Map<string, Graph>(); // the graph for each set of collapsed statuses, built when first asked for
   let lastSync: number | null = null; // when the source was last read successfully
   let lastAttempt: number | null = null;
   let syncError: string | null = null;
@@ -608,8 +627,9 @@ export function createApp(options: AppOptions): Server {
     lastAttempt = now();
     running = options
       .source()
-      .then((issues) => {
-        graph = buildGraph(issues);
+      .then((read) => {
+        issues = read;
+        graphs.clear();
         lastSync = now();
         syncError = null;
       })
@@ -626,13 +646,22 @@ export function createApp(options: AppOptions): Server {
 
   const tooSoon = (): boolean => lastAttempt !== null && now() - lastAttempt < minRefreshMs;
 
-  const sendGraph = (res: ServerResponse, extra: Record<string, unknown> = {}): void => {
-    if (!graph) {
+  /** The statuses named in ?collapse=done,blocked. Anything that is not a status is ignored. */
+  const collapsedIn = (url: URL): Status[] => {
+    const asked = (url.searchParams.get("collapse") ?? "").split(",");
+    return STATUSES.filter((status) => asked.includes(status));
+  };
+
+  const sendGraph = (res: ServerResponse, collapsed: Status[], extra: Record<string, unknown> = {}): void => {
+    if (!issues) {
       sendJson(res, 503, { error: syncError ?? "the issues have not been read yet" });
       return;
     }
+    const key = collapsed.join(",");
+    if (!graphs.has(key)) graphs.set(key, buildGraph(issues, { collapse: collapsed }));
     sendJson(res, 200, {
-      ...graph,
+      ...graphs.get(key)!,
+      collapsed,
       lastSync: new Date(lastSync!).toISOString(),
       syncError,
       refreshSeconds: refreshMs / 1000,
@@ -641,7 +670,8 @@ export function createApp(options: AppOptions): Server {
   };
 
   const handle = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
-    const path = new URL(req.url ?? "/", "http://localhost").pathname;
+    const url = new URL(req.url ?? "/", "http://localhost");
+    const path = url.pathname;
     const method = req.method ?? "GET";
     const read = method === "GET" || method === "HEAD";
 
@@ -651,18 +681,18 @@ export function createApp(options: AppOptions): Server {
       return;
     }
     if (path === "/api/graph" && read) {
-      if (!graph) {
+      if (!issues) {
         if (!tooSoon() || running) await refresh();
       } else if (now() - lastSync! > refreshMs && !running && !tooSoon()) {
         void refresh(); // answer with the old copy now; the next request gets the new one
       }
-      sendGraph(res);
+      sendGraph(res, collapsedIn(url));
       return;
     }
     if (path === "/api/refresh" && method === "POST") {
       const throttled = !running && tooSoon();
       if (!throttled) await refresh();
-      sendGraph(res, { throttled });
+      sendGraph(res, collapsedIn(url), { throttled });
       return;
     }
     const file = files.get(path);
