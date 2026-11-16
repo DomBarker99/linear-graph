@@ -1,0 +1,6 @@
+.git
+.github
+.idea
+node_modules
+server.test.ts
+sample.json

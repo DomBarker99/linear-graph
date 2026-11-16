@@ -1,0 +1,438 @@
+[
+  {
+    "id": "sample-1",
+    "identifier": "DEMO-1",
+    "title": "Agree on the feature list",
+    "url": "https://linear.app/example/issue/DEMO-1",
+    "priority": 0,
+    "dueDate": "2026-01-09",
+    "state": {
+      "name": "Done",
+      "type": "completed",
+      "color": "#5e6ad2"
+    },
+    "assignee": {
+      "name": "Ada Example"
+    },
+    "project": {
+      "id": "sample-project",
+      "name": "Sample project"
+    },
+    "projectMilestone": {
+      "id": "m-plan",
+      "name": "Plan",
+      "targetDate": "2026-01-16",
+      "sortOrder": 10
+    },
+    "relations": {
+      "nodes": [
+        {
+          "type": "blocks",
+          "relatedIssue": {
+            "id": "sample-2"
+          }
+        },
+        {
+          "type": "blocks",
+          "relatedIssue": {
+            "id": "sample-3"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "id": "sample-2",
+    "identifier": "DEMO-2",
+    "title": "Sketch the screens",
+    "url": "https://linear.app/example/issue/DEMO-2",
+    "priority": 0,
+    "dueDate": "2026-01-14",
+    "state": {
+      "name": "Done",
+      "type": "completed",
+      "color": "#5e6ad2"
+    },
+    "assignee": {
+      "name": "Ben Example"
+    },
+    "project": {
+      "id": "sample-project",
+      "name": "Sample project"
+    },
+    "projectMilestone": {
+      "id": "m-plan",
+      "name": "Plan",
+      "targetDate": "2026-01-16",
+      "sortOrder": 10
+    },
+    "relations": {
+      "nodes": [
+        {
+          "type": "blocks",
+          "relatedIssue": {
+            "id": "sample-5"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "id": "sample-3",
+    "identifier": "DEMO-3",
+    "title": "Design the database tables",
+    "url": "https://linear.app/example/issue/DEMO-3",
+    "priority": 0,
+    "dueDate": "2026-01-16",
+    "state": {
+      "name": "In Progress",
+      "type": "started",
+      "color": "#f2c94c"
+    },
+    "assignee": {
+      "name": "Ada Example"
+    },
+    "project": {
+      "id": "sample-project",
+      "name": "Sample project"
+    },
+    "projectMilestone": {
+      "id": "m-plan",
+      "name": "Plan",
+      "targetDate": "2026-01-16",
+      "sortOrder": 10
+    },
+    "relations": {
+      "nodes": [
+        {
+          "type": "blocks",
+          "relatedIssue": {
+            "id": "sample-4"
+          }
+        },
+        {
+          "type": "blocks",
+          "relatedIssue": {
+            "id": "sample-6"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "id": "sample-4",
+    "identifier": "DEMO-4",
+    "title": "Write the table-creation script",
+    "url": "https://linear.app/example/issue/DEMO-4",
+    "priority": 0,
+    "dueDate": "2026-01-23",
+    "state": {
+      "name": "Todo",
+      "type": "unstarted",
+      "color": "#e2e2e2"
+    },
+    "assignee": {
+      "name": "Ada Example"
+    },
+    "project": {
+      "id": "sample-project",
+      "name": "Sample project"
+    },
+    "projectMilestone": {
+      "id": "m-build",
+      "name": "Build",
+      "targetDate": "2026-02-13",
+      "sortOrder": 20
+    },
+    "relations": {
+      "nodes": [
+        {
+          "type": "blocks",
+          "relatedIssue": {
+            "id": "sample-6"
+          }
+        },
+        {
+          "type": "blocks",
+          "relatedIssue": {
+            "id": "sample-7"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "id": "sample-5",
+    "identifier": "DEMO-5",
+    "title": "Set up the app skeleton",
+    "url": "https://linear.app/example/issue/DEMO-5",
+    "priority": 0,
+    "dueDate": "2026-01-21",
+    "state": {
+      "name": "In Progress",
+      "type": "started",
+      "color": "#f2c94c"
+    },
+    "assignee": {
+      "name": "Ben Example"
+    },
+    "project": {
+      "id": "sample-project",
+      "name": "Sample project"
+    },
+    "projectMilestone": {
+      "id": "m-build",
+      "name": "Build",
+      "targetDate": "2026-02-13",
+      "sortOrder": 20
+    },
+    "relations": {
+      "nodes": [
+        {
+          "type": "blocks",
+          "relatedIssue": {
+            "id": "sample-6"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "id": "sample-6",
+    "identifier": "DEMO-6",
+    "title": "Data access functions",
+    "url": "https://linear.app/example/issue/DEMO-6",
+    "priority": 0,
+    "dueDate": "2026-01-30",
+    "state": {
+      "name": "Todo",
+      "type": "unstarted",
+      "color": "#e2e2e2"
+    },
+    "assignee": {
+      "name": "Cy Example"
+    },
+    "project": {
+      "id": "sample-project",
+      "name": "Sample project"
+    },
+    "projectMilestone": {
+      "id": "m-build",
+      "name": "Build",
+      "targetDate": "2026-02-13",
+      "sortOrder": 20
+    },
+    "relations": {
+      "nodes": [
+        {
+          "type": "blocks",
+          "relatedIssue": {
+            "id": "sample-8"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "id": "sample-7",
+    "identifier": "DEMO-7",
+    "title": "Sample data for every table",
+    "url": "https://linear.app/example/issue/DEMO-7",
+    "priority": 0,
+    "dueDate": null,
+    "state": {
+      "name": "Backlog",
+      "type": "backlog",
+      "color": "#bec2c8"
+    },
+    "assignee": null,
+    "project": {
+      "id": "sample-project",
+      "name": "Sample project"
+    },
+    "projectMilestone": {
+      "id": "m-build",
+      "name": "Build",
+      "targetDate": "2026-02-13",
+      "sortOrder": 20
+    },
+    "relations": {
+      "nodes": [
+        {
+          "type": "blocks",
+          "relatedIssue": {
+            "id": "sample-10"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "id": "sample-8",
+    "identifier": "DEMO-8",
+    "title": "Screens: list, add, edit, delete",
+    "url": "https://linear.app/example/issue/DEMO-8",
+    "priority": 0,
+    "dueDate": "2026-02-10",
+    "state": {
+      "name": "Todo",
+      "type": "unstarted",
+      "color": "#e2e2e2"
+    },
+    "assignee": {
+      "name": "Ben Example"
+    },
+    "project": {
+      "id": "sample-project",
+      "name": "Sample project"
+    },
+    "projectMilestone": {
+      "id": "m-build",
+      "name": "Build",
+      "targetDate": "2026-02-13",
+      "sortOrder": 20
+    },
+    "relations": {
+      "nodes": [
+        {
+          "type": "blocks",
+          "relatedIssue": {
+            "id": "sample-9"
+          }
+        },
+        {
+          "type": "blocks",
+          "relatedIssue": {
+            "id": "sample-10"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "id": "sample-9",
+    "identifier": "DEMO-9",
+    "title": "Reports screen",
+    "url": "https://linear.app/example/issue/DEMO-9",
+    "priority": 0,
+    "dueDate": null,
+    "state": {
+      "name": "Backlog",
+      "type": "backlog",
+      "color": "#bec2c8"
+    },
+    "assignee": {
+      "name": "Cy Example"
+    },
+    "project": {
+      "id": "sample-project",
+      "name": "Sample project"
+    },
+    "projectMilestone": {
+      "id": "m-build",
+      "name": "Build",
+      "targetDate": "2026-02-13",
+      "sortOrder": 20
+    },
+    "relations": {
+      "nodes": [
+        {
+          "type": "blocks",
+          "relatedIssue": {
+            "id": "sample-10"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "id": "sample-10",
+    "identifier": "DEMO-10",
+    "title": "Test everything end to end",
+    "url": "https://linear.app/example/issue/DEMO-10",
+    "priority": 0,
+    "dueDate": "2026-02-20",
+    "state": {
+      "name": "Backlog",
+      "type": "backlog",
+      "color": "#bec2c8"
+    },
+    "assignee": null,
+    "project": {
+      "id": "sample-project",
+      "name": "Sample project"
+    },
+    "projectMilestone": {
+      "id": "m-ship",
+      "name": "Ship",
+      "targetDate": "2026-02-27",
+      "sortOrder": 30
+    },
+    "relations": {
+      "nodes": [
+        {
+          "type": "blocks",
+          "relatedIssue": {
+            "id": "sample-11"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "id": "sample-11",
+    "identifier": "DEMO-11",
+    "title": "Write the report and submit",
+    "url": "https://linear.app/example/issue/DEMO-11",
+    "priority": 0,
+    "dueDate": "2026-02-27",
+    "state": {
+      "name": "Backlog",
+      "type": "backlog",
+      "color": "#bec2c8"
+    },
+    "assignee": null,
+    "project": {
+      "id": "sample-project",
+      "name": "Sample project"
+    },
+    "projectMilestone": {
+      "id": "m-ship",
+      "name": "Ship",
+      "targetDate": "2026-02-27",
+      "sortOrder": 30
+    },
+    "relations": {
+      "nodes": []
+    }
+  },
+  {
+    "id": "sample-12",
+    "identifier": "DEMO-12",
+    "title": "Collect screenshots for the slides",
+    "url": "https://linear.app/example/issue/DEMO-12",
+    "priority": 0,
+    "dueDate": null,
+    "state": {
+      "name": "Todo",
+      "type": "unstarted",
+      "color": "#e2e2e2"
+    },
+    "assignee": {
+      "name": "Cy Example"
+    },
+    "project": {
+      "id": "sample-project",
+      "name": "Sample project"
+    },
+    "projectMilestone": {
+      "id": "m-ship",
+      "name": "Ship",
+      "targetDate": "2026-02-27",
+      "sortOrder": 30
+    },
+    "relations": {
+      "nodes": []
+    }
+  }
+]

@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Linear graph</title>
+<link rel="icon" href="data:,">
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0f1117;
+    --panel: #171a23;
+    --card: #1c202b;
+    --line: #2a2f3d;
+    --text: #e6e8ee;
+    --muted: #8b93a7;
+    --todo: #8b93a7;
+    --started: #f2b23e;
+    --done: #3fb97a;
+    --ready: #4c9dff;
+    --blocked: #e8833a;
+    --overdue: #ff6b6b;
+    --edge: #4a5166;
+    --edge-met: #2f5c47;
+    --select: #9d8cff;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      color-scheme: light;
+      --bg: #f4f5f8;
+      --panel: #ffffff;
+      --card: #ffffff;
+      --line: #d9dce5;
+      --text: #1b1e27;
+      --muted: #687086;
+      --todo: #8088a0;
+      --started: #c98a0c;
+      --done: #1f9d5f;
+      --ready: #1f6fe0;
+      --blocked: #cf6a1c;
+      --overdue: #d93838;
+      --edge: #a3a9bb;
+      --edge-met: #9fd0b7;
+      --select: #6c55f0;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: flex; flex-direction: column;
+    background: var(--bg); color: var(--text);
+    font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  button { font: inherit; color: inherit; cursor: pointer; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+  header {
+    display: flex; align-items: center; gap: 16px;
+    padding: 10px 18px; background: var(--panel); border-bottom: 1px solid var(--line);
+  }
+  header h1 { margin: 0; font-size: 15px; font-weight: 600; }
+  #sync { margin-left: auto; color: var(--muted); }
+  #sync.failing { color: var(--overdue); }
+  header button {
+    padding: 5px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--card);
+  }
+  header button:hover { border-color: var(--muted); }
+  header button:disabled { opacity: .5; cursor: default; }
+
+  #summary {
+    display: flex; flex-wrap: wrap; gap: 10px 28px; align-items: flex-end;
+    padding: 12px 18px; border-bottom: 1px solid var(--line);
+  }
+  .meter { min-width: 150px; }
+  .meter.overall { min-width: 240px; }
+  .meter .label { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 4px; }
+  .meter .name { font-weight: 600; white-space: nowrap; }
+  .meter .count { color: var(--muted); white-space: nowrap; }
+  .meter .date { color: var(--muted); font-weight: 400; }
+  .meter .date.overdue { color: var(--overdue); }
+  .bar { display: flex; height: 6px; border-radius: 3px; overflow: hidden; background: var(--line); }
+  .bar .done { background: var(--done); }
+  .bar .started { background: var(--started); }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+
+  #notes { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; padding: 8px 18px; border-bottom: 1px solid var(--line); color: var(--muted); }
+  #notes:empty { display: none; }
+  .chip {
+    padding: 2px 8px; border: 1px solid var(--ready); border-radius: 10px; background: none; color: var(--ready);
+  }
+  .chip:hover { background: color-mix(in srgb, var(--ready) 15%, transparent); }
+  .warning { color: var(--blocked); }
+  .legend { margin-left: auto; display: flex; gap: 14px; }
+  .legend span::before {
+    content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px;
+    background: var(--swatch);
+  }
+
+  #body { flex: 1; display: flex; min-height: 0; }
+  /* The stage is a window onto the sheet (#canvas), which app.js moves and scales. */
+  #stage {
+    flex: 1; position: relative; overflow: hidden; cursor: grab; touch-action: none;
+    user-select: none; -webkit-user-select: none;
+    background-image: radial-gradient(circle, var(--line) 1px, transparent 1.5px);
+  }
+  #stage.dragging, #stage.dragging .card { cursor: grabbing; }
+  #canvas { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
+  #canvas.gliding { transition: transform .25s ease; }
+  .controls {
+    position: absolute; left: 14px; bottom: 14px; display: flex; flex-direction: column; overflow: hidden;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px; cursor: default;
+  }
+  .controls button { width: 34px; height: 32px; border: none; background: none; font-size: 16px; line-height: 1; }
+  .controls button + button { border-top: 1px solid var(--line); }
+  .controls button:hover { background: var(--card); }
+  #zoom-fit { font-size: 11px; }
+  #minimap {
+    position: absolute; right: 14px; bottom: 14px; cursor: pointer;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  }
+  #map-nodes rect { fill: var(--todo); }
+  #map-nodes rect.started { fill: var(--started); }
+  #map-nodes rect.done { fill: var(--done); }
+  #map-nodes rect.ready { fill: var(--ready); }
+  #map-nodes rect.blocked { fill: var(--blocked); }
+  #map-nodes rect.selected { stroke: var(--select); stroke-width: 24; }
+  #map-view {
+    fill: color-mix(in srgb, var(--select) 12%, transparent);
+    stroke: var(--select); stroke-width: 2; vector-effect: non-scaling-stroke;
+  }
+  #edges { position: absolute; inset: 0; pointer-events: none; }
+  .edge { color: var(--edge); }
+  .edge.met { color: var(--edge-met); }
+  .edge.cyclic { color: var(--overdue); }
+  .edge.lit { color: var(--select); }
+  .edge .line { fill: none; stroke: currentColor; stroke-width: 1.5; }
+  .edge .head { fill: currentColor; }
+  .edge.cyclic .line { stroke-dasharray: 5 4; }
+  .edge.lit .line { stroke-width: 2.5; }
+  #edges.focused .edge:not(.lit) { opacity: .18; }
+
+  .card {
+    position: absolute; display: flex; flex-direction: column; gap: 3px;
+    padding: 8px 10px 8px 12px; text-align: left;
+    background: var(--card); border: 1px solid var(--line); border-left: 4px solid var(--todo); border-radius: 8px;
+  }
+  .card:hover { border-color: var(--muted); border-left-color: var(--accent, var(--todo)); }
+  .card.started { --accent: var(--started); border-left-color: var(--started); }
+  .card.done { --accent: var(--done); border-left-color: var(--done); }
+  .card.ready { --accent: var(--ready); border-left-color: var(--ready); }
+  .card.blocked { --accent: var(--blocked); border-left-color: var(--blocked); }
+  .card.done .title { color: var(--muted); text-decoration: line-through; }
+  .card.selected { outline: 2px solid var(--select); outline-offset: 1px; }
+  #cards.focused .card:not(.lit) { opacity: .28; }
+  .card .top, .card .bottom { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .card .id { color: var(--muted); font-size: 11px; }
+  .card .state { font-size: 11px; color: var(--accent, var(--muted)); white-space: nowrap; }
+  .card .title {
+    flex: 1; font-weight: 500; line-height: 1.3; overflow: hidden;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  }
+  .card .bottom { font-size: 11px; color: var(--muted); }
+  .card .who { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .card .due { white-space: nowrap; }
+  .overdue { color: var(--overdue); font-weight: 600; }
+
+  #detail {
+    width: 340px; flex: none; overflow: auto; padding: 16px 18px;
+    background: var(--panel); border-left: 1px solid var(--line);
+  }
+  #detail[hidden] { display: none; }
+  #detail .close { float: right; border: none; background: none; color: var(--muted); font-size: 18px; line-height: 1; }
+  #detail h2 { margin: 2px 0 10px; font-size: 15px; }
+  #detail a { color: var(--ready); text-decoration: none; }
+  #detail a:hover { text-decoration: underline; }
+  #detail dl { display: grid; grid-template-columns: 90px 1fr; gap: 6px 10px; margin: 14px 0; }
+  #detail dt { color: var(--muted); }
+  #detail dd { margin: 0; }
+  #detail h3 { margin: 18px 0 6px; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+  #detail .link {
+    display: flex; gap: 8px; align-items: baseline; width: 100%; padding: 5px 6px; text-align: left;
+    border: none; border-radius: 5px; background: none;
+  }
+  #detail .link:hover { background: var(--card); }
+  #detail .link .id { color: var(--muted); font-size: 11px; white-space: nowrap; }
+  #detail .none { color: var(--muted); padding: 0 6px; }
+
+  #message { position: relative; margin: 0; padding: 40px 18px; color: var(--muted); }
+  #message[hidden] { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">Linear graph</h1>
+  <span id="sync"></span>
+  <button id="refresh" type="button">Refresh</button>
+</header>
+<section id="summary"></section>
+<section id="notes"></section>
+<div id="body">
+  <main id="stage">
+    <p id="message">Reading the issues…</p>
+    <div id="canvas">
+      <svg id="edges" xmlns="http://www.w3.org/2000/svg"></svg>
+      <div id="cards"></div>
+    </div>
+    <div class="controls">
+      <button id="zoom-in" type="button" title="Zoom in (+)">+</button>
+      <button id="zoom-out" type="button" title="Zoom out (−)">−</button>
+      <button id="zoom-fit" type="button" title="Show everything (0)">Fit</button>
+    </div>
+    <svg id="minimap" xmlns="http://www.w3.org/2000/svg">
+      <g id="map-nodes"></g>
+      <rect id="map-view"></rect>
+    </svg>
+  </main>
+  <aside id="detail" hidden></aside>
+</div>
+<script type="module" src="/app.js"></script>
+</body>
+</html>
