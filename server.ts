@@ -2,12 +2,13 @@
 //
 // Linear shows "blocked by" and "blocks" on each issue but has no picture of the
 // whole chain. This server reads the issues with a read-only Linear API key,
-// works out the graph (columns, rows, which issues are ready to start) and
-// serves one page that draws it.
+// works out the graph (where each card goes, which issues are ready to start)
+// and serves one page that draws it.
 //
 //   GET  /              the page (public/index.html, public/app.js)
 //   GET  /api/graph     the graph as JSON; re-reads Linear when the copy is old
-//                       ?collapse=done,blocked draws those issues as dots instead of cards
+//                       ?collapse=done,blocked folds each of those statuses into one dot
+//                       ?flow=right runs the lines left to right instead of down the page
 //   POST /api/refresh   re-read Linear now (at most once every few seconds)
 //   GET  /healthz       "ok"
 //
@@ -158,10 +159,10 @@ export type GraphNode = {
   priority: number;
   /** Milestone id, or "none". */
   milestone: string;
-  /** Column, counted from 0 on the left. */
-  col: number;
-  /** Vertical position in card heights, 0 at the top. */
-  y: number;
+  /** How far along the flow, counted from 0. Each issue is one rank past the last thing that blocks it. */
+  rank: number;
+  /** Position across the flow, in card widths (or card heights when the flow runs left to right), 0 at the start. */
+  across: number;
   done: boolean;
   /** Not done, and at least one issue that blocks it is not done. */
   blocked: boolean;
@@ -169,9 +170,11 @@ export type GraphNode = {
   ready: boolean;
   /** The one word the page colours by: done, blocked, started or ready. */
   status: Status;
-  /** Drawn as a dot instead of a card, because its status was asked to be collapsed. */
+  /** Its status is collapsed: it is not drawn, and its rank and across are those of the dot that stands for it. */
   collapsed: boolean;
+  /** Every issue that blocks this one, drawn or not. */
   blockedBy: string[];
+  /** Every issue this one blocks, drawn or not. */
   blocks: string[];
 };
 
@@ -179,14 +182,31 @@ export type GraphNode = {
 export const STATUSES = ["ready", "started", "blocked", "done"] as const;
 export type Status = (typeof STATUSES)[number];
 
+/** Which way the blocking lines run: down the page, or left to right. */
+export const FLOWS = ["down", "right"] as const;
+export type Flow = (typeof FLOWS)[number];
+
+/** The one dot that stands for every issue of a collapsed status. */
+export type GraphGroup = {
+  /** "group:done" and so on. Lines use this where an issue id would be. */
+  id: string;
+  status: Status;
+  /** The issues it stands for. */
+  members: string[];
+  rank: number;
+  across: number;
+};
+
 export type GraphEdge = {
-  /** The blocking issue. */
+  /** The blocking issue, or the dot it is collapsed into. */
   from: string;
-  /** The issue it blocks. */
+  /** The issue it blocks, or the dot that is collapsed into. */
   to: string;
   /** Part of a loop (A blocks B blocks A). Drawn differently and left out of the layout. */
   cyclic: boolean;
-  /** [col, y] from source to target. Long edges get one point per column they pass. */
+  /** Not a relation in Linear: the two are linked only through collapsed issues in between. */
+  via: boolean;
+  /** [rank, across] from source to target. Long lines get one point per rank they pass. */
   points: [number, number][];
 };
 
@@ -201,25 +221,29 @@ export type Milestone = {
 
 export type Graph = {
   title: string;
+  flow: Flow;
   nodes: GraphNode[];
+  groups: GraphGroup[];
   edges: GraphEdge[];
   milestones: Milestone[];
   totals: { total: number; done: number; started: number };
-  columns: number;
-  /** Height of the tallest column, in card heights. */
-  height: number;
+  /** How many ranks the flow has. */
+  ranks: number;
+  /** How far the widest rank reaches across, in the same unit as `across`. */
+  breadth: number;
   warnings: string[];
 };
 
 const NO_MILESTONE = "none";
 
-// Vertical room each thing takes, in card heights. A long edge passing through
-// a column takes a thin slot, so cards are never drawn on top of a line.
-// An issue collapsed to a dot takes the same thin slot as a line.
+// Room each thing takes across the flow, where a card takes 1. A long line
+// passing through a rank gets a thin slot of its own, so cards are never drawn
+// on top of a line. When the flow runs down the page the unit is a card's
+// width, which is much more than a line needs, so the thin slots are thinner.
 const CARD_SLOT = 1;
-const LINE_SLOT = 0.3;
-const DOT_SLOT = 0.3;
-const SLOT_GAP = 0.08;
+const DOT_SLOT = { down: 0.16, right: 0.36 };
+const LINE_SLOT = { down: 0.1, right: 0.3 };
+const SLOT_GAP = { down: 0.07, right: 0.08 };
 
 /** "CS1-9" sorts before "CS1-14". */
 function compareIdentifiers(a: string, b: string): number {
@@ -239,7 +263,7 @@ function mean(values: number[]): number {
 
 /**
  * Closest non-decreasing sequence to the given one (least squares). Used to
- * move the things in a column toward where they want to be without letting
+ * move the things in a rank toward where they want to be without letting
  * them swap places or overlap.
  */
 function nonDecreasingFit(values: number[]): number[] {
@@ -258,9 +282,13 @@ function nonDecreasingFit(values: number[]): number[] {
   return blocks.flatMap((block) => Array<number>(block.count).fill(block.sum / block.count));
 }
 
-/** Turn Linear's issues into nodes with positions, edges, and progress counts. */
-export function buildGraph(issues: LinearIssue[], options: { collapse?: Iterable<Status> } = {}): Graph {
+/**
+ * Turn Linear's issues into things with positions, the lines between them, and progress counts.
+ * collapse: statuses whose issues are folded into one dot each. flow: which way the lines run.
+ */
+export function buildGraph(issues: LinearIssue[], options: { collapse?: Iterable<Status>; flow?: Flow } = {}): Graph {
   const collapse = new Set(options.collapse ?? []);
+  const flow: Flow = options.flow ?? "down";
   const warnings: string[] = [];
   // Cancelled and duplicate issues are left out: they are neither work to do nor work done.
   const kept = issues
@@ -270,10 +298,10 @@ export function buildGraph(issues: LinearIssue[], options: { collapse?: Iterable
   const issueOf = new Map(kept.map((issue) => [issue.identifier, issue]));
   const ids = kept.map((issue) => issue.identifier);
 
-  // --- Edges: "A blocks B" becomes A -> B -------------------------------
+  // --- Relations: "A blocks B", as Linear has them -----------------------
   const blocks = new Map<string, string[]>(ids.map((id) => [id, []]));
   const blockedBy = new Map<string, string[]>(ids.map((id) => [id, []]));
-  const edgeKeys = new Set<string>();
+  const relationKeys = new Set<string>();
   for (const issue of kept) {
     if (issue.relations?.pageInfo?.hasNextPage) {
       warnings.push(`${issue.identifier} has more relations than were read; some of its lines may be missing`);
@@ -283,81 +311,141 @@ export function buildGraph(issues: LinearIssue[], options: { collapse?: Iterable
       const target = byLinearId.get(relation.relatedIssue.id);
       if (!target || target.id === issue.id) continue;
       const key = `${issue.identifier}>${target.identifier}`;
-      if (edgeKeys.has(key)) continue;
-      edgeKeys.add(key);
+      if (relationKeys.has(key)) continue;
+      relationKeys.add(key);
       blocks.get(issue.identifier)!.push(target.identifier);
       blockedBy.get(target.identifier)!.push(issue.identifier);
     }
   }
   for (const list of [...blocks.values(), ...blockedBy.values()]) list.sort(compareIdentifiers);
 
-  // --- Loops: find the edges that close a loop and set them aside --------
-  const cyclic = new Set<string>();
-  const visitState = new Map<string, "open" | "closed">();
-  const visit = (id: string): void => {
-    visitState.set(id, "open");
-    for (const next of blocks.get(id)!) {
-      const state = visitState.get(next);
-      if (state === "open") cyclic.add(`${id}>${next}`);
-      else if (state === undefined) visit(next);
-    }
-    visitState.set(id, "closed");
-  };
-  for (const id of ids) if (!visitState.has(id)) visit(id);
-  if (cyclic.size > 0) warnings.push(`${cyclic.size} blocking relation(s) form a loop; they are drawn dashed`);
-
-  const after = new Map(ids.map((id) => [id, blocks.get(id)!.filter((next) => !cyclic.has(`${id}>${next}`))]));
-  const before = new Map(ids.map((id) => [id, blockedBy.get(id)!.filter((prev) => !cyclic.has(`${prev}>${id}`))]));
-
-  // --- Columns: one further right than the last thing that blocks it -----
-  const col = new Map<string, number>();
-  const waitingOn = new Map(ids.map((id) => [id, before.get(id)!.length]));
-  const queue = ids.filter((id) => waitingOn.get(id) === 0);
-  for (let head = 0; head < queue.length; head++) {
-    const id = queue[head];
-    col.set(id, Math.max(-1, ...before.get(id)!.map((prev) => col.get(prev)!)) + 1);
-    for (const next of after.get(id)!) {
-      waitingOn.set(next, waitingOn.get(next)! - 1);
-      if (waitingOn.get(next) === 0) queue.push(next);
-    }
-  }
-  // An issue nothing blocks would sit in the first column with a long line to
-  // what it blocks. Move it next to that instead.
-  for (const id of ids) {
-    if (before.get(id)!.length === 0 && after.get(id)!.length > 0) {
-      col.set(id, Math.min(...after.get(id)!.map((next) => col.get(next)!)) - 1);
-    }
-  }
-  const columns = ids.length === 0 ? 0 : Math.max(...col.values()) + 1;
-
-  // --- Status of each issue, and which ones are collapsed to a dot ---------
+  // --- Status of each issue, and which ones are collapsed ----------------
   const isDone = (id: string): boolean => issueOf.get(id)!.state.type === "completed";
   const isBlocked = (id: string): boolean => !isDone(id) && blockedBy.get(id)!.some((prev) => !isDone(prev));
   const statusOf = (id: string): Status =>
     isDone(id) ? "done" : isBlocked(id) ? "blocked" : issueOf.get(id)!.state.type === "started" ? "started" : "ready";
-  const isCollapsed = (id: string): boolean => collapse.has(statusOf(id));
+  const hidden = new Set(ids.filter((id) => collapse.has(statusOf(id))));
+  const shown = ids.filter((id) => !hidden.has(id));
+  const groupOf = (id: string): string => `group:${statusOf(id)}`;
+  const groupIds = STATUSES.map((status) => `group:${status}`).filter((group) => ids.some((id) => hidden.has(id) && groupOf(id) === group));
+  const isGroup = (item: string): boolean => item.startsWith("group:");
+  /** What is drawn for an issue: itself, or the dot it is collapsed into. */
+  const itemOf = (id: string): string => (hidden.has(id) ? groupOf(id) : id);
+  /** Everything the layout places: the issues still shown, then one dot per collapsed status. */
+  const items = [...shown, ...groupIds];
 
-  // --- Slots: every column holds cards or dots, plus a thin slot for each line passing through
-  type Slot = { key: string; room: number };
-  const layers: Slot[][] = Array.from({ length: columns }, () => []);
-  const left = new Map<string, string[]>(); // slot -> slots it connects to in the column before
-  const right = new Map<string, string[]>(); // slot -> slots it connects to in the column after
-  const connect = (a: string, b: string): void => {
-    right.set(a, [...(right.get(a) ?? []), b]);
-    left.set(b, [...(left.get(b) ?? []), a]);
+  // --- Lines between the things that are drawn ---------------------------
+  type Line = { from: string; to: string; via: boolean };
+  const lines = new Map<string, Line>();
+  const addLine = (from: string, to: string, via: boolean): void => {
+    if (from === to) return;
+    const key = `${from}>${to}`;
+    const existing = lines.get(key);
+    if (!existing) lines.set(key, { from, to, via });
+    else if (!via) existing.via = false;
   };
-  const milestoneOrder = (id: string): number => issueOf.get(id)!.projectMilestone?.sortOrder ?? Number.MAX_VALUE;
-  for (const id of [...ids].sort((a, b) => milestoneOrder(a) - milestoneOrder(b) || compareIdentifiers(a, b))) {
-    layers[col.get(id)!].push({ key: id, room: isCollapsed(id) ? DOT_SLOT : CARD_SLOT });
+  for (const from of ids) for (const to of blocks.get(from)!) addLine(itemOf(from), itemOf(to), false);
+  // Two shown issues linked only through collapsed ones keep a line, marked as indirect.
+  for (const from of shown) {
+    const seen = new Set<string>();
+    const queue = blocks.get(from)!.filter((id) => hidden.has(id));
+    while (queue.length > 0) {
+      const id = queue.pop()!;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      for (const next of blocks.get(id)!) {
+        if (hidden.has(next)) queue.push(next);
+        else if (next !== from) addLine(from, next, true);
+      }
+    }
   }
-  const passes = new Map<string, string[]>(); // edge -> the thin slots it passes through
-  for (const from of ids) {
+  // A dot stands for several issues, so the same card can sit both before and after it.
+  // Keep the dot before the card and drop the line back into it; otherwise it would be a loop.
+  for (const group of groupIds) {
+    const reached = new Set<string>();
+    const queue = [group];
+    while (queue.length > 0) {
+      const at = queue.pop()!;
+      for (const line of lines.values()) {
+        if (line.from === at && line.to !== group && !reached.has(line.to)) {
+          reached.add(line.to);
+          queue.push(line.to);
+        }
+      }
+    }
+    for (const [key, line] of lines) if (line.to === group && reached.has(line.from)) lines.delete(key);
+  }
+  const compareItems = (a: string, b: string): number =>
+    isGroup(a) !== isGroup(b) ? (isGroup(a) ? 1 : -1) : isGroup(a) ? groupIds.indexOf(a) - groupIds.indexOf(b) : compareIdentifiers(a, b);
+  const outOf = new Map<string, string[]>(items.map((item) => [item, []]));
+  const into = new Map<string, string[]>(items.map((item) => [item, []]));
+  for (const line of lines.values()) {
+    outOf.get(line.from)!.push(line.to);
+    into.get(line.to)!.push(line.from);
+  }
+  for (const list of [...outOf.values(), ...into.values()]) list.sort(compareItems);
+
+  // --- Loops: find the lines that close a loop and set them aside --------
+  const cyclic = new Set<string>();
+  const visitState = new Map<string, "open" | "closed">();
+  const visit = (item: string): void => {
+    visitState.set(item, "open");
+    for (const next of outOf.get(item)!) {
+      const state = visitState.get(next);
+      if (state === "open") cyclic.add(`${item}>${next}`);
+      else if (state === undefined) visit(next);
+    }
+    visitState.set(item, "closed");
+  };
+  for (const item of items) if (!visitState.has(item)) visit(item);
+  if (cyclic.size > 0) warnings.push(`${cyclic.size} blocking relation(s) form a loop; they are drawn dashed`);
+
+  const after = new Map(items.map((item) => [item, outOf.get(item)!.filter((next) => !cyclic.has(`${item}>${next}`))]));
+  const before = new Map(items.map((item) => [item, into.get(item)!.filter((prev) => !cyclic.has(`${prev}>${item}`))]));
+
+  // --- Ranks: one further along than the last thing that blocks it -------
+  const rank = new Map<string, number>();
+  const waitingOn = new Map(items.map((item) => [item, before.get(item)!.length]));
+  const queue = items.filter((item) => waitingOn.get(item) === 0);
+  for (let head = 0; head < queue.length; head++) {
+    const item = queue[head];
+    rank.set(item, Math.max(-1, ...before.get(item)!.map((prev) => rank.get(prev)!)) + 1);
+    for (const next of after.get(item)!) {
+      waitingOn.set(next, waitingOn.get(next)! - 1);
+      if (waitingOn.get(next) === 0) queue.push(next);
+    }
+  }
+  // Something nothing blocks would sit in the first rank with a long line to
+  // what it blocks. Move it next to that instead.
+  for (const item of items) {
+    if (before.get(item)!.length === 0 && after.get(item)!.length > 0) {
+      rank.set(item, Math.min(...after.get(item)!.map((next) => rank.get(next)!)) - 1);
+    }
+  }
+  const ranks = items.length === 0 ? 0 : Math.max(...rank.values()) + 1;
+
+  // --- Slots: every rank holds cards and dots, plus a thin slot for each line passing through
+  type Slot = { key: string; room: number };
+  const layers: Slot[][] = Array.from({ length: ranks }, () => []);
+  const backward = new Map<string, string[]>(); // slot -> slots it connects to in the rank before
+  const forward = new Map<string, string[]>(); // slot -> slots it connects to in the rank after
+  const connect = (a: string, b: string): void => {
+    forward.set(a, [...(forward.get(a) ?? []), b]);
+    backward.set(b, [...(backward.get(b) ?? []), a]);
+  };
+  const milestoneOrder = (item: string): number =>
+    isGroup(item) ? -1 : (issueOf.get(item)!.projectMilestone?.sortOrder ?? Number.MAX_VALUE);
+  for (const item of [...items].sort((a, b) => milestoneOrder(a) - milestoneOrder(b) || compareItems(a, b))) {
+    layers[rank.get(item)!].push({ key: item, room: isGroup(item) ? DOT_SLOT[flow] : CARD_SLOT });
+  }
+  const passes = new Map<string, string[]>(); // line -> the thin slots it passes through
+  for (const from of items) {
     for (const to of after.get(from)!) {
       const through: string[] = [];
       let previous = from;
-      for (let column = col.get(from)! + 1; column < col.get(to)!; column++) {
-        const key = `${from}>${to}@${column}`;
-        layers[column].push({ key, room: LINE_SLOT });
+      for (let at = rank.get(from)! + 1; at < rank.get(to)!; at++) {
+        const key = `${from}>${to}@${at}`;
+        layers[at].push({ key, room: LINE_SLOT[flow] });
         connect(previous, key);
         through.push(key);
         previous = key;
@@ -367,15 +455,15 @@ export function buildGraph(issues: LinearIssue[], options: { collapse?: Iterable
     }
   }
 
-  // --- Order within each column: fewest crossing lines -------------------
+  // --- Order within each rank: fewest crossing lines ---------------------
   const position = new Map<string, number>();
   const renumber = (): void => layers.forEach((layer) => layer.forEach((slot, index) => position.set(slot.key, index)));
   const crossings = (): number => {
     let count = 0;
-    for (let column = 0; column + 1 < layers.length; column++) {
+    for (let at = 0; at + 1 < layers.length; at++) {
       const segments: [number, number][] = [];
-      for (const slot of layers[column]) {
-        for (const next of right.get(slot.key) ?? []) segments.push([position.get(slot.key)!, position.get(next)!]);
+      for (const slot of layers[at]) {
+        for (const next of forward.get(slot.key) ?? []) segments.push([position.get(slot.key)!, position.get(next)!]);
       }
       for (let a = 0; a < segments.length; a++) {
         for (let b = a + 1; b < segments.length; b++) {
@@ -400,22 +488,22 @@ export function buildGraph(issues: LinearIssue[], options: { collapse?: Iterable
   let best = layers.map((layer) => [...layer]);
   let fewest = crossings();
   for (let round = 0; round < 12 && fewest > 0; round++) {
-    if (round % 2 === 0) for (let column = 1; column < layers.length; column++) reorder(layers[column], left);
-    else for (let column = layers.length - 2; column >= 0; column--) reorder(layers[column], right);
+    if (round % 2 === 0) for (let at = 1; at < layers.length; at++) reorder(layers[at], backward);
+    else for (let at = layers.length - 2; at >= 0; at--) reorder(layers[at], forward);
     const now = crossings();
     if (now < fewest) {
       fewest = now;
       best = layers.map((layer) => [...layer]);
     }
   }
-  best.forEach((layer, column) => (layers[column] = layer));
+  best.forEach((layer, at) => (layers[at] = layer));
   renumber();
   // Then swap neighbours wherever that alone removes a crossing.
-  const crossingsBetween = (above: string, below: string): number => {
+  const crossingsBetween = (first: string, second: string): number => {
     let count = 0;
-    for (const neighbours of [left, right]) {
-      for (const a of neighbours.get(above) ?? []) {
-        for (const b of neighbours.get(below) ?? []) if (position.get(a)! > position.get(b)!) count++;
+    for (const neighbours of [backward, forward]) {
+      for (const a of neighbours.get(first) ?? []) {
+        for (const b of neighbours.get(second) ?? []) if (position.get(a)! > position.get(b)!) count++;
       }
     }
     return count;
@@ -424,39 +512,39 @@ export function buildGraph(issues: LinearIssue[], options: { collapse?: Iterable
     swapped = false;
     for (const layer of layers) {
       for (let index = 0; index + 1 < layer.length; index++) {
-        const above = layer[index];
-        const below = layer[index + 1];
-        if (crossingsBetween(below.key, above.key) < crossingsBetween(above.key, below.key)) {
-          layer[index] = below;
-          layer[index + 1] = above;
-          position.set(below.key, index);
-          position.set(above.key, index + 1);
+        const first = layer[index];
+        const second = layer[index + 1];
+        if (crossingsBetween(second.key, first.key) < crossingsBetween(first.key, second.key)) {
+          layer[index] = second;
+          layer[index + 1] = first;
+          position.set(second.key, index);
+          position.set(first.key, index + 1);
           swapped = true;
         }
       }
     }
   }
 
-  // --- Height of each slot: pull connected things level with each other --
-  const y = new Map<string, number>();
+  // --- Place each slot across the flow: pull connected things into line --
+  const across = new Map<string, number>();
   const offsets = layers.map((layer) => {
     const offset = [0];
     for (let index = 1; index < layer.length; index++) {
-      offset.push(offset[index - 1] + (layer[index - 1].room + layer[index].room) / 2 + SLOT_GAP);
+      offset.push(offset[index - 1] + (layer[index - 1].room + layer[index].room) / 2 + SLOT_GAP[flow]);
     }
     return offset;
   });
-  layers.forEach((layer, column) => {
-    const middle = (offsets[column][layer.length - 1] ?? 0) / 2;
-    layer.forEach((slot, index) => y.set(slot.key, offsets[column][index] - middle));
+  layers.forEach((layer, at) => {
+    const middle = (offsets[at][layer.length - 1] ?? 0) / 2;
+    layer.forEach((slot, index) => across.set(slot.key, offsets[at][index] - middle));
   });
-  const settle = (column: number, neighbours: (key: string) => string[]): void => {
-    const layer = layers[column];
+  const settle = (at: number, neighbours: (key: string) => string[]): void => {
+    const layer = layers[at];
     // How far each slot wants to move from its packed place. A slot with nothing to line up
     // with has no wish of its own and stays packed against the nearest slot that has one.
     const shift: (number | null)[] = layer.map((slot, index) => {
       const near = neighbours(slot.key);
-      return near.length ? mean(near.map((key) => y.get(key)!)) - offsets[column][index] : null;
+      return near.length ? mean(near.map((key) => across.get(key)!)) - offsets[at][index] : null;
     });
     if (shift.every((value) => value === null)) return;
     const wished = shift.map((value, index) => {
@@ -466,20 +554,20 @@ export function buildGraph(issues: LinearIssue[], options: { collapse?: Iterable
       return value!;
     });
     const fitted = nonDecreasingFit(wished);
-    layer.forEach((slot, index) => y.set(slot.key, fitted[index] + offsets[column][index]));
+    layer.forEach((slot, index) => across.set(slot.key, fitted[index] + offsets[at][index]));
   };
-  const leftOf = (key: string): string[] => left.get(key) ?? [];
-  const rightOf = (key: string): string[] => right.get(key) ?? [];
+  const backwardOf = (key: string): string[] => backward.get(key) ?? [];
+  const forwardOf = (key: string): string[] => forward.get(key) ?? [];
   for (let round = 0; round < 8; round++) {
-    for (let column = 1; column < layers.length; column++) settle(column, leftOf);
-    for (let column = layers.length - 2; column >= 0; column--) settle(column, rightOf);
+    for (let at = 1; at < layers.length; at++) settle(at, backwardOf);
+    for (let at = layers.length - 2; at >= 0; at--) settle(at, forwardOf);
   }
-  for (let column = 0; column < layers.length; column++) settle(column, (key) => [...leftOf(key), ...rightOf(key)]);
-  const top = y.size === 0 ? 0 : Math.min(...y.values());
-  for (const [key, value] of y) y.set(key, round2(value - top));
-  const height = ids.length === 0 ? 0 : round2(Math.max(...layers.flat().map((slot) => y.get(slot.key)!)) + 1);
+  for (let at = 0; at < layers.length; at++) settle(at, (key) => [...backwardOf(key), ...forwardOf(key)]);
+  const start = across.size === 0 ? 0 : Math.min(...across.values());
+  for (const [key, value] of across) across.set(key, round2(value - start));
+  const breadth = items.length === 0 ? 0 : round2(Math.max(...layers.flat().map((slot) => across.get(slot.key)!)) + 1);
 
-  // --- Nodes -------------------------------------------------------------
+  // --- Nodes and the dots that stand for collapsed ones -------------------
   const nodes: GraphNode[] = kept.map((issue) => {
     const id = issue.identifier;
     const status = statusOf(id);
@@ -492,32 +580,40 @@ export function buildGraph(issues: LinearIssue[], options: { collapse?: Iterable
       dueDate: issue.dueDate ?? null,
       priority: issue.priority ?? 0,
       milestone: issue.projectMilestone?.id ?? NO_MILESTONE,
-      col: col.get(id)!,
-      y: y.get(id)!,
+      rank: rank.get(itemOf(id))!,
+      across: across.get(itemOf(id))!,
       done: status === "done",
       blocked: status === "blocked",
       ready: status === "ready",
       status,
-      collapsed: collapse.has(status),
+      collapsed: hidden.has(id),
       blockedBy: blockedBy.get(id)!,
       blocks: blocks.get(id)!,
     };
   });
+  const groups: GraphGroup[] = groupIds.map((group) => ({
+    id: group,
+    status: group.slice("group:".length) as Status,
+    members: ids.filter((id) => hidden.has(id) && groupOf(id) === group),
+    rank: rank.get(group)!,
+    across: across.get(group)!,
+  }));
 
   // --- Edges with the points their lines pass through --------------------
   const edges: GraphEdge[] = [];
-  for (const from of ids) {
-    for (const to of blocks.get(from)!) {
+  for (const from of items) {
+    for (const to of outOf.get(from)!) {
       const key = `${from}>${to}`;
       const through = cyclic.has(key) ? [] : passes.get(key)!;
       edges.push({
         from,
         to,
         cyclic: cyclic.has(key),
+        via: lines.get(key)!.via,
         points: [
-          [col.get(from)!, y.get(from)!],
-          ...through.map((slot, index): [number, number] => [col.get(from)! + 1 + index, y.get(slot)!]),
-          [col.get(to)!, y.get(to)!],
+          [rank.get(from)!, across.get(from)!],
+          ...through.map((slot, index): [number, number] => [rank.get(from)! + 1 + index, across.get(slot)!]),
+          [rank.get(to)!, across.get(to)!],
         ],
       });
     }
@@ -551,7 +647,9 @@ export function buildGraph(issues: LinearIssue[], options: { collapse?: Iterable
   const projects = [...new Set(kept.map((issue) => issue.project?.name).filter((name): name is string => !!name))];
   return {
     title: projects.length === 0 ? "Linear issues" : projects.slice(0, 3).join(" · "),
+    flow,
     nodes,
+    groups,
     edges,
     milestones: ordered,
     totals: {
@@ -559,8 +657,8 @@ export function buildGraph(issues: LinearIssue[], options: { collapse?: Iterable
       done: nodes.filter((node) => node.done).length,
       started: nodes.filter((node) => node.state.type === "started").length,
     },
-    columns,
-    height,
+    ranks,
+    breadth,
     warnings,
   };
 }
@@ -615,7 +713,7 @@ export function createApp(options: AppOptions): Server {
   ]);
 
   let issues: LinearIssue[] | null = null; // the last good read
-  const graphs = new Map<string, Graph>(); // the graph for each set of collapsed statuses, built when first asked for
+  const graphs = new Map<string, Graph>(); // the graph for each way of drawing it, built when first asked for
   let lastSync: number | null = null; // when the source was last read successfully
   let lastAttempt: number | null = null;
   let syncError: string | null = null;
@@ -652,13 +750,17 @@ export function createApp(options: AppOptions): Server {
     return STATUSES.filter((status) => asked.includes(status));
   };
 
-  const sendGraph = (res: ServerResponse, collapsed: Status[], extra: Record<string, unknown> = {}): void => {
+  const flowIn = (url: URL): Flow => (url.searchParams.get("flow") === "right" ? "right" : "down");
+
+  const sendGraph = (res: ServerResponse, url: URL, extra: Record<string, unknown> = {}): void => {
     if (!issues) {
       sendJson(res, 503, { error: syncError ?? "the issues have not been read yet" });
       return;
     }
-    const key = collapsed.join(",");
-    if (!graphs.has(key)) graphs.set(key, buildGraph(issues, { collapse: collapsed }));
+    const collapsed = collapsedIn(url);
+    const flow = flowIn(url);
+    const key = `${flow}|${collapsed.join(",")}`;
+    if (!graphs.has(key)) graphs.set(key, buildGraph(issues, { collapse: collapsed, flow }));
     sendJson(res, 200, {
       ...graphs.get(key)!,
       collapsed,
@@ -686,13 +788,13 @@ export function createApp(options: AppOptions): Server {
       } else if (now() - lastSync! > refreshMs && !running && !tooSoon()) {
         void refresh(); // answer with the old copy now; the next request gets the new one
       }
-      sendGraph(res, collapsedIn(url));
+      sendGraph(res, url);
       return;
     }
     if (path === "/api/refresh" && method === "POST") {
       const throttled = !running && tooSoon();
       if (!throttled) await refresh();
-      sendGraph(res, collapsedIn(url), { throttled });
+      sendGraph(res, url, { throttled });
       return;
     }
     const file = files.get(path);

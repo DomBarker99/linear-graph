@@ -62,44 +62,44 @@ function node(graph: Graph, number: number): GraphNode {
 
 // --- The graph ---------------------------------------------------------------
 
-test("each issue sits one column right of the last thing that blocks it", () => {
+test("each issue sits one rank past the last thing that blocks it", () => {
   // 1 -> 2 -> 4, and 3 -> 4
   const graph = buildGraph([issue(1, { blocks: [2] }), issue(2, { blocks: [4] }), issue(3, { blocks: [4] }), issue(4)]);
-  assert.equal(node(graph, 1).col, 0);
-  assert.equal(node(graph, 2).col, 1);
-  assert.equal(node(graph, 4).col, 2);
-  assert.equal(graph.columns, 3);
+  assert.equal(node(graph, 1).rank, 0);
+  assert.equal(node(graph, 2).rank, 1);
+  assert.equal(node(graph, 4).rank, 2);
+  assert.equal(graph.ranks, 3);
   assert.deepEqual(node(graph, 4).blockedBy, ["T-2", "T-3"]);
   assert.deepEqual(node(graph, 1).blocks, ["T-2"]);
 });
 
-test("an issue nothing blocks is placed next to what it blocks, not in the first column", () => {
+test("an issue nothing blocks is placed next to what it blocks, not in the first rank", () => {
   const graph = buildGraph([issue(1, { blocks: [2] }), issue(2, { blocks: [4] }), issue(3, { blocks: [4] }), issue(4)]);
-  assert.equal(node(graph, 3).col, 1);
+  assert.equal(node(graph, 3).rank, 1);
 });
 
-test("an issue with no relations at all stays in the first column", () => {
+test("an issue with no relations at all stays in the first rank", () => {
   const graph = buildGraph([issue(1, { blocks: [2] }), issue(2), issue(3)]);
-  assert.equal(node(graph, 3).col, 0);
+  assert.equal(node(graph, 3).rank, 0);
   assert.deepEqual(node(graph, 3).blocks, []);
 });
 
-test("a line that skips columns gets a point in each column it passes", () => {
+test("a line that skips ranks gets a point in each rank it passes", () => {
   // 1 -> 2 -> 3 -> 4, and 1 -> 4 directly
   const graph = buildGraph([issue(1, { blocks: [2, 4] }), issue(2, { blocks: [3] }), issue(3, { blocks: [4] }), issue(4)]);
   const long = graph.edges.find((edge) => edge.from === "T-1" && edge.to === "T-4");
   assert.ok(long);
   assert.deepEqual(
-    long.points.map(([col]) => col),
+    long.points.map(([rank]) => rank),
     [0, 1, 2, 3],
   );
-  assert.deepEqual(long.points[0], [0, node(graph, 1).y]);
-  assert.deepEqual(long.points[3], [3, node(graph, 4).y]);
+  assert.deepEqual(long.points[0], [0, node(graph, 1).across]);
+  assert.deepEqual(long.points[3], [3, node(graph, 4).across]);
   const short = graph.edges.find((edge) => edge.from === "T-1" && edge.to === "T-2");
   assert.equal(short?.points.length, 2);
 });
 
-test("nothing in a column overlaps: cards are a full card apart, and passing lines keep clear of cards", () => {
+test("nothing in a rank overlaps: cards are a full card apart, and passing lines keep clear of cards", () => {
   // A wide, tangled graph: every issue in one group blocks every issue in the next, with some long jumps.
   const issues = [
     issue(1, { blocks: [4, 5, 6, 9] }),
@@ -115,19 +115,19 @@ test("nothing in a column overlaps: cards are a full card apart, and passing lin
     issue(11),
   ];
   const graph = buildGraph(issues);
-  for (let col = 0; col < graph.columns; col++) {
-    const cards = graph.nodes.filter((entry) => entry.col === col).map((entry) => entry.y);
-    const lines = graph.edges.flatMap((edge) => edge.points.slice(1, -1).filter((point) => point[0] === col).map((point) => point[1]));
+  for (let rank = 0; rank < graph.ranks; rank++) {
+    const cards = graph.nodes.filter((entry) => entry.rank === rank).map((entry) => entry.across);
+    const lines = graph.edges.flatMap((edge) => edge.points.slice(1, -1).filter((point) => point[0] === rank).map((point) => point[1]));
     const sorted = [...cards].sort((a, b) => a - b);
     for (let index = 1; index < sorted.length; index++) {
-      assert.ok(sorted[index] - sorted[index - 1] >= 1, `cards in column ${col} are at least one card apart`);
+      assert.ok(sorted[index] - sorted[index - 1] >= 1, `cards in rank ${rank} are at least one card apart`);
     }
     for (const line of lines) {
-      for (const card of cards) assert.ok(Math.abs(line - card) >= 0.6, `a line in column ${col} keeps clear of the cards`);
+      for (const card of cards) assert.ok(Math.abs(line - card) >= 0.55, `a line in rank ${rank} keeps clear of the cards`);
     }
   }
-  assert.ok(Math.min(...graph.nodes.map((entry) => entry.y)) >= 0);
-  assert.ok(graph.height >= Math.max(...graph.nodes.map((entry) => entry.y)) + 1);
+  assert.ok(Math.min(...graph.nodes.map((entry) => entry.across)) >= 0);
+  assert.ok(graph.breadth >= Math.max(...graph.nodes.map((entry) => entry.across)) + 1);
 });
 
 test("ready, blocked and done follow the state of the blocking issues", () => {
@@ -213,8 +213,8 @@ test("progress is counted per milestone, in Linear's milestone order", () => {
 test("an empty list gives an empty graph", () => {
   const graph = buildGraph([]);
   assert.deepEqual(graph.nodes, []);
-  assert.equal(graph.columns, 0);
-  assert.equal(graph.height, 0);
+  assert.equal(graph.ranks, 0);
+  assert.equal(graph.breadth, 0);
   assert.equal(graph.title, "Linear issues");
 });
 
@@ -224,7 +224,7 @@ test("a relation list that was cut short is reported", () => {
   assert.match(buildGraph([cut, issue(2)]).warnings.join(" "), /T-1 has more relations/);
 });
 
-test("every issue gets one status, and a collapsed status turns its issues into dots", () => {
+test("every issue gets one status, and a collapsed status folds its issues into one dot", () => {
   const issues = [
     issue(1, { state: "completed", blocks: [3] }),
     issue(2, { state: "completed", blocks: [3] }),
@@ -238,46 +238,87 @@ test("every issue gets one status, and a collapsed status turns its issues into 
     ["done", "done", "ready", "blocked", "started"],
   );
   assert.ok(open.nodes.every((entry) => !entry.collapsed));
+  assert.deepEqual(open.groups, []);
 
   const folded = buildGraph(issues, { collapse: ["done", "started"] });
   assert.deepEqual(
     folded.nodes.map((entry) => entry.collapsed),
     [true, true, false, false, true],
   );
-  // Collapsing changes how things are drawn, not what they are or where the lines go.
   assert.deepEqual(
-    folded.nodes.map((entry) => [entry.id, entry.status, entry.col]),
-    open.nodes.map((entry) => [entry.id, entry.status, entry.col]),
+    folded.groups.map((group) => [group.id, group.status, group.members]),
+    [
+      ["group:started", "started", ["T-5"]],
+      ["group:done", "done", ["T-1", "T-2"]],
+    ],
   );
+  // The two lines from the done issues into T-3 become one line from the dot.
   assert.deepEqual(
     folded.edges.map((edge) => `${edge.from}>${edge.to}`),
-    open.edges.map((edge) => `${edge.from}>${edge.to}`),
+    ["T-3>T-4", "group:done>T-3"],
   );
+  // A collapsed issue is placed where its dot is, and keeps its real relations for the side panel.
+  const done = folded.groups.find((group) => group.id === "group:done")!;
+  assert.deepEqual([node(folded, 1).rank, node(folded, 1).across], [done.rank, done.across]);
+  assert.deepEqual(node(folded, 1).blocks, ["T-3"]);
+  assert.deepEqual(node(folded, 3).blockedBy, ["T-1", "T-2"]);
+  assert.equal(done.rank, node(folded, 3).rank - 1);
 });
 
-test("dots take less room than cards, and still never overlap", () => {
+test("collapsing makes the graph smaller", () => {
   const issues = [
-    issue(1, { state: "completed", blocks: [5] }),
-    issue(2, { state: "completed", blocks: [5] }),
-    issue(3, { state: "completed", blocks: [5] }),
+    issue(1, { state: "completed", blocks: [4] }),
+    issue(2, { state: "completed", blocks: [4] }),
+    issue(3, { state: "completed", blocks: [4] }),
     issue(4, { blocks: [5] }),
     issue(5),
   ];
-  const gaps = (graph: Graph): number[] => {
-    const column = graph.nodes.filter((entry) => entry.col === 0).sort((a, b) => a.y - b.y);
-    return column.slice(1).map((entry, index) => +(entry.y - column[index].y).toFixed(2));
-  };
   const open = buildGraph(issues);
   const folded = buildGraph(issues, { collapse: ["done"] });
-  assert.ok(gaps(open).every((gap) => gap >= 1));
-  assert.ok(folded.height < open.height, "the collapsed graph is shorter");
-  const column = folded.nodes.filter((entry) => entry.col === 0).sort((a, b) => a.y - b.y);
-  for (let index = 1; index < column.length; index++) {
-    const both = column[index].collapsed && column[index - 1].collapsed;
-    const either = column[index].collapsed || column[index - 1].collapsed;
-    const least = both ? 0.3 : either ? 0.65 : 1;
-    assert.ok(column[index].y - column[index - 1].y >= least, `${column[index - 1].id} and ${column[index].id} keep apart`);
-  }
+  assert.equal(folded.ranks, open.ranks);
+  assert.ok(folded.breadth < open.breadth, "three cards side by side became one dot");
+  assert.equal(folded.nodes.filter((entry) => !entry.collapsed).length, 2);
+});
+
+test("two shown issues linked only through collapsed ones keep an indirect line", () => {
+  // done T-1 -> ready T-2 -> blocked T-3, with the ready one collapsed
+  const graph = buildGraph([issue(1, { state: "completed", blocks: [2] }), issue(2, { blocks: [3] }), issue(3)], { collapse: ["ready"] });
+  const lines = graph.edges.map((edge) => `${edge.from}>${edge.to}${edge.via ? " (indirect)" : ""}`).sort();
+  assert.deepEqual(lines, ["T-1>T-3 (indirect)", "T-1>group:ready", "group:ready>T-3"]);
+  assert.deepEqual(graph.warnings, []);
+});
+
+test("a dot that sits both before and after the same card is not treated as a loop", () => {
+  // done T-1 -> T-2 -> done T-3: with done collapsed, the dot both blocks T-2 and is blocked by it
+  const graph = buildGraph([issue(1, { state: "completed", blocks: [2] }), issue(2, { blocks: [3] }), issue(3, { state: "completed" })], {
+    collapse: ["done"],
+  });
+  assert.deepEqual(
+    graph.edges.map((edge) => `${edge.from}>${edge.to}`),
+    ["group:done>T-2"],
+  );
+  assert.ok(graph.edges.every((edge) => !edge.cyclic));
+  assert.deepEqual(graph.warnings, []);
+});
+
+test("the flow runs down the page unless asked to run right, and only the spacing differs", () => {
+  // T-1 -> T-2 -> T-3 with a direct T-1 -> T-3 that has to pass T-2
+  const issues = [issue(1, { blocks: [2, 3] }), issue(2, { blocks: [3] }), issue(3)];
+  const down = buildGraph(issues);
+  const right = buildGraph(issues, { flow: "right" });
+  assert.equal(down.flow, "down");
+  assert.equal(right.flow, "right");
+  assert.deepEqual(
+    down.nodes.map((entry) => [entry.id, entry.rank]),
+    right.nodes.map((entry) => [entry.id, entry.rank]),
+  );
+  const clearance = (graph: Graph): number => {
+    const passing = graph.edges.find((edge) => edge.points.length === 3)!.points[1][1];
+    return Math.abs(passing - node(graph, 2).across);
+  };
+  // A card is far wider than it is tall, so a passing line needs a smaller share of a card's width.
+  assert.ok(clearance(down) < clearance(right));
+  assert.ok(clearance(down) >= 0.55);
 });
 
 // --- Reading Linear ------------------------------------------------------------
@@ -515,15 +556,17 @@ test("POST /api/refresh reads the source again, but not twice within a few secon
   }
 });
 
-test("?collapse= picks the statuses drawn as dots, ignores anything else, and does not re-read Linear", async () => {
+test("?collapse= and ?flow= choose how the graph is drawn, ignore anything else, and do not re-read Linear", async () => {
   const app = await start(() => [issue(1, { state: "completed", blocks: [2] }), issue(2)]);
   try {
     const plain = await (await fetch(`${app.url}/api/graph`)).json();
     assert.deepEqual(plain.collapsed, []);
+    assert.equal(plain.flow, "down");
     assert.ok(plain.nodes.every((entry: GraphNode) => !entry.collapsed));
 
-    const folded = await (await fetch(`${app.url}/api/graph?collapse=done,nonsense,__proto__`)).json();
+    const folded = await (await fetch(`${app.url}/api/graph?collapse=done,nonsense,__proto__&flow=right`)).json();
     assert.deepEqual(folded.collapsed, ["done"]);
+    assert.equal(folded.flow, "right");
     assert.deepEqual(
       folded.nodes.map((entry: GraphNode) => [entry.id, entry.collapsed]),
       [
@@ -531,6 +574,12 @@ test("?collapse= picks the statuses drawn as dots, ignores anything else, and do
         ["T-2", false],
       ],
     );
+    assert.deepEqual(
+      folded.groups.map((group: { id: string }) => group.id),
+      ["group:done"],
+    );
+
+    assert.equal((await (await fetch(`${app.url}/api/graph?flow=sideways`)).json()).flow, "down");
 
     const refreshed = await (await fetch(`${app.url}/api/refresh?collapse=ready`, { method: "POST" })).json();
     assert.deepEqual(refreshed.collapsed, ["ready"]);
