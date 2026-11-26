@@ -33,11 +33,13 @@ const PRIORITIES = ["None", "Urgent", "High", "Medium", "Low"];
 const STATUSES = { ready: "Ready", started: "In progress", blocked: "Blocked", done: "Done" };
 const COLLAPSED_KEY = "linear-graph.collapsed";
 const FLOW_KEY = "linear-graph.flow";
+const PROJECT_KEY = "linear-graph.project";
 const SVG = "http://www.w3.org/2000/svg";
 
 const $ = (id) => document.getElementById(id);
 const view = {
   title: $("title"),
+  project: $("project"),
   sync: $("sync"),
   refresh: $("refresh"),
   summary: $("summary"),
@@ -58,6 +60,10 @@ const view = {
 };
 
 let graph = null;
+// All configured projects from /api/projects, and which one is open.
+let projects = [];
+let activeProject = new URLSearchParams(location.search).get("project") || null;
+let loadSeq = 0;
 // What is selected: an issue ("CS1-14") or a collapsed status's dot ("group:done").
 // Kept in the address (#CS1-14), so a link opens on the same thing.
 let selected = decodeURIComponent(location.hash.slice(1)) || null;
@@ -152,21 +158,98 @@ function ago(iso) {
   return `at ${new Date(iso).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}`;
 }
 
+function syncUrl(push = false) {
+  const params = new URLSearchParams(location.search);
+  if (projects.length > 1 && activeProject) params.set("project", activeProject);
+  else params.delete("project");
+  const query = params.toString() ? `?${params}` : "";
+  const hash = selected ? `#${encodeURIComponent(selected)}` : "";
+  const target = `${location.pathname}${query}${hash}`;
+  if (target === `${location.pathname}${location.search}${location.hash}`) return;
+  if (push) history.pushState(null, "", target);
+  else history.replaceState(null, "", target);
+}
+
+function drawProjects() {
+  const multi = projects.length > 1;
+  view.title.hidden = multi;
+  view.project.hidden = !multi;
+  if (!multi) return;
+  view.project.replaceChildren(...projects.map((entry) => el("option", { value: entry.id, text: entry.name })));
+  if (activeProject) view.project.value = activeProject;
+}
+
+function switchProject(id, { push = true, nextSelected = null } = {}) {
+  if (!id || (id === activeProject && graph !== null)) return;
+  activeProject = id;
+  store(PROJECT_KEY, id);
+  selected = nextSelected;
+  graph = null;
+  drawn.clear();
+  view.cards.replaceChildren();
+  view.edges.replaceChildren();
+  view.summary.replaceChildren();
+  view.notes.replaceChildren();
+  view.detail.hidden = true;
+  view.detail.replaceChildren();
+  view.minimap.style.display = "none";
+  view.message.textContent = "Reading the issues…";
+  view.message.hidden = false;
+  view.sync.textContent = "";
+  view.sync.className = "";
+  fitted = true;
+  refitNext = true;
+  if (projects.length > 1) view.project.value = id;
+  syncUrl(push);
+  load();
+}
+
 // --- Loading ---------------------------------------------------------------
 
-async function load(refresh = false) {
+async function init() {
   try {
-    // The server lays the graph out, so it has to know what is collapsed and which way the lines run.
+    const response = await fetch("/api/projects");
+    if (response.ok) {
+      const body = await response.json();
+      projects = Array.isArray(body.projects) ? body.projects : [];
+      const fromUrl = new URLSearchParams(location.search).get("project");
+      const fromStorage = stored(PROJECT_KEY, null);
+      const valid = (id) => Boolean(id && projects.some((entry) => entry.id === id));
+      if (valid(fromUrl)) activeProject = fromUrl;
+      else if (valid(fromStorage)) activeProject = fromStorage;
+      else activeProject = projects[0]?.id ?? null;
+      if (activeProject) store(PROJECT_KEY, activeProject);
+      drawProjects();
+      syncUrl(false);
+    }
+  } catch {
+    // Fall through so load() shows the connection error in the usual place.
+  }
+  await load();
+}
+
+async function load(refresh = false) {
+  const seq = ++loadSeq;
+  try {
+    // The server lays the graph out, so it has to know which project, what is collapsed, and which way the lines run.
     const query = new URLSearchParams();
+    if (activeProject) query.set("project", activeProject);
     if (collapsed.size) query.set("collapse", [...collapsed].join(","));
     if (flow === "right") query.set("flow", "right");
     const response = await fetch(`${refresh ? "/api/refresh" : "/api/graph"}?${query}`, { method: refresh ? "POST" : "GET" });
     const body = await response.json();
+    if (seq !== loadSeq) return;
     if (!response.ok) throw new Error(body.error ?? `HTTP ${response.status}`);
+    if (Array.isArray(body.projects) && JSON.stringify(body.projects) !== JSON.stringify(projects)) {
+      projects = body.projects;
+      drawProjects();
+    }
+    if (body.project?.id) activeProject = body.project.id;
     graph = body;
     if (selected && !thing(selected)) selected = null;
     draw();
   } catch (error) {
+    if (seq !== loadSeq) return;
     view.sync.textContent = `Could not load: ${error.message}`;
     view.sync.className = "failing";
     if (!graph) view.message.textContent = `Could not read the issues: ${error.message}`;
@@ -266,8 +349,10 @@ function box(item) {
 // --- Drawing ---------------------------------------------------------------
 
 function draw() {
-  document.title = `${graph.title} · graph`;
+  const heading = projects.length > 1 ? (graph.project?.name ?? graph.title) : graph.title;
+  document.title = `${heading} · graph`;
   view.title.textContent = graph.title;
+  if (projects.length > 1 && activeProject) view.project.value = activeProject;
   view.message.hidden = graph.nodes.length > 0;
   if (graph.nodes.length === 0) view.message.textContent = "No issues to show.";
   view.flow.textContent = flow === "down" ? "↓" : "→";
@@ -692,7 +777,7 @@ function drawDetail() {
 
 function select(id, scroll = false) {
   selected = id;
-  history.replaceState(null, "", id ? `#${encodeURIComponent(id)}` : location.pathname);
+  syncUrl(false);
   drawGraph();
   drawDetail();
   if (id && scroll) centreOn(id);
@@ -700,6 +785,21 @@ function select(id, scroll = false) {
 
 // --- Wiring ----------------------------------------------------------------
 
+view.project.addEventListener("change", () => {
+  view.project.blur();
+  switchProject(view.project.value);
+});
+window.addEventListener("popstate", () => {
+  const fromUrl = new URLSearchParams(location.search).get("project") ?? projects[0]?.id ?? null;
+  const fromHash = decodeURIComponent(location.hash.slice(1)) || null;
+  if (fromUrl && fromUrl !== activeProject && projects.some((entry) => entry.id === fromUrl)) {
+    switchProject(fromUrl, { push: false, nextSelected: fromHash });
+  } else if (graph && fromHash !== selected) {
+    selected = fromHash && thing(fromHash) ? fromHash : null;
+    drawGraph();
+    drawDetail();
+  }
+});
 view.refresh.addEventListener("click", async () => {
   view.refresh.disabled = true;
   await load(true);
@@ -803,6 +903,7 @@ new ResizeObserver(() => (fitted ? fit(false) : drawMapView())).observe(view.sta
 view.stage.addEventListener("click", () => selected && select(null));
 document.addEventListener("keydown", (event) => {
   if (event.metaKey || event.ctrlKey || event.altKey) return; // leave the browser's own shortcuts alone
+  if (event.target instanceof Element && event.target.closest("input, select, textarea")) return;
   if (event.key === "Escape" && selected) select(null);
   else if (event.key === "+" || event.key === "=") zoomAtCentre(ZOOM_STEP);
   else if (event.key === "-") zoomAtCentre(1 / ZOOM_STEP);
@@ -816,4 +917,4 @@ setInterval(() => {
 }, POLL_MS);
 setInterval(showSync, 30_000);
 
-load();
+init();

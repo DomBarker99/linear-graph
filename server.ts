@@ -6,23 +6,31 @@
 // and serves one page that draws it.
 //
 //   GET  /              the page (public/index.html, public/app.js)
+//   GET  /api/projects  the configured projects ({ projects: [{ id, name }] })
 //   GET  /api/graph     the graph as JSON; re-reads Linear when the copy is old
+//                       ?project=<id> selects which configured project to serve (defaults to the first)
 //                       ?collapse=done,blocked folds each of those statuses into one dot
 //                       ?flow=right runs the lines left to right instead of down the page
-//   POST /api/refresh   re-read Linear now (at most once every few seconds)
+//   POST /api/refresh   re-read Linear now (at most once every few seconds); accepts ?project=<id>
 //   GET  /healthz       "ok"
 //
 // Nothing here writes to Linear: the only request it ever sends is one query.
 // There is no login. Whoever can reach the port can read the issues.
 //
 // Settings (environment):
-//   LINEAR_API_KEY    a Linear personal API key with Read permission only
-//   LINEAR_TEAM       optional team key, e.g. CS1: only that team's issues
-//   LINEAR_PROJECT    optional project name: only that project's issues
-//   REFRESH_SECONDS   how old the copy may get before Linear is read again (default 120)
-//   PORT              default 8080
-//   HOST              address to listen on (default 0.0.0.0; use 127.0.0.1 to keep it to this machine)
-//   GRAPH_FIXTURE     path to a JSON file of issues, read instead of Linear (for trying it locally)
+//   LINEAR_GRAPHS       optional JSON array of projects to visualize, e.g.:
+//                       [{"id":"cs157a","name":"CS157A","apiKeyEnv":"LINEAR_API_KEY_CS157A","team":"CS1","project":"..."}]
+//                       Each entry has id, optional name, optional apiKeyEnv (defaults to LINEAR_API_KEY,
+//                       must match LINEAR_API_KEY or LINEAR_API_KEY_*), optional team, optional project,
+//                       or fixture (JSON file path for local testing).
+//   LINEAR_GRAPHS_FILE  optional path to a JSON file with the same array format as LINEAR_GRAPHS
+//   LINEAR_API_KEY      a Linear personal API key with Read permission only (single-project mode or default key)
+//   LINEAR_TEAM         optional team key in single-project mode, e.g. CS1: only that team's issues
+//   LINEAR_PROJECT      optional project name in single-project mode: only that project's issues
+//   REFRESH_SECONDS     how old the copy may get before Linear is read again (default 120)
+//   PORT                default 8080
+//   HOST                address to listen on (default 0.0.0.0; use 127.0.0.1 to keep it to this machine)
+//   GRAPH_FIXTURE       path to a JSON file of issues in single-project mode (for trying it locally)
 //
 // Run:   LINEAR_API_KEY=... LINEAR_TEAM=CS1 node server.ts
 // Try:   GRAPH_FIXTURE=sample.json HOST=127.0.0.1 node server.ts
@@ -668,12 +676,138 @@ function round2(value: number): number {
 }
 
 // ---------------------------------------------------------------------------
+// Project configuration
+// ---------------------------------------------------------------------------
+
+export type ProjectEntry = {
+  /** URL-safe slug used in ?project=<id>. */
+  id: string;
+  /** Label shown in the project switcher. */
+  name: string;
+  /** Where this project's issues come from. */
+  source: () => Promise<LinearIssue[]>;
+  /** Short description for the startup log (never contains secrets). */
+  description?: string;
+};
+
+export type GraphSpec = {
+  id: string;
+  name?: string;
+  apiKeyEnv?: string;
+  team?: string;
+  project?: string;
+  fixture?: string;
+};
+
+const PROJECT_ID_PATTERN = /^[a-z0-9][a-z0-9_-]*$/;
+const API_KEY_ENV_PATTERN = /^LINEAR_API_KEY(?:_[A-Z0-9_]+)?$/;
+
+function optionalString(value: unknown, field: string, context: string): string | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  if (typeof value !== "string") throw new Error(`${context}: "${field}" must be a string`);
+  return value;
+}
+
+/**
+ * Load one or more project sources from environment variables.
+ * Uses LINEAR_GRAPHS / LINEAR_GRAPHS_FILE when set; otherwise falls back to
+ * single-project LINEAR_API_KEY / LINEAR_TEAM / LINEAR_PROJECT / GRAPH_FIXTURE.
+ */
+export function loadProjects(
+  env: Record<string, string | undefined>,
+  options: { fetchImpl?: typeof fetch; readConfigFile?: (path: string) => string } = {},
+): ProjectEntry[] {
+  const inline = env.LINEAR_GRAPHS?.trim();
+  const file = env.LINEAR_GRAPHS_FILE?.trim();
+  if (inline && file) {
+    throw new Error("set LINEAR_GRAPHS or LINEAR_GRAPHS_FILE, not both");
+  }
+  if (inline || file) {
+    const raw = inline || (options.readConfigFile ?? ((path) => readFileSync(path, "utf8")))(file!);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (error: unknown) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(`could not parse ${file ? "LINEAR_GRAPHS_FILE" : "LINEAR_GRAPHS"} JSON: ${detail}`);
+    }
+    if (!Array.isArray(parsed) || parsed.length === 0) {
+      throw new Error(`${file ? "LINEAR_GRAPHS_FILE" : "LINEAR_GRAPHS"} must be a non-empty JSON array`);
+    }
+    const seen = new Set<string>();
+    return parsed.map((entry, index): ProjectEntry => {
+      const context = `project entry #${index + 1}`;
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        throw new Error(`${context}: expected a JSON object`);
+      }
+      const spec = entry as Record<string, unknown>;
+      const id = optionalString(spec.id, "id", context);
+      if (!id || !PROJECT_ID_PATTERN.test(id)) {
+        throw new Error(`${context}: "id" must match ${PROJECT_ID_PATTERN} (lowercase letters, digits, - or _)`);
+      }
+      if (seen.has(id)) throw new Error(`duplicate project id "${id}"`);
+      seen.add(id);
+
+      const team = optionalString(spec.team, "team", `project "${id}"`);
+      const project = optionalString(spec.project, "project", `project "${id}"`);
+      const fixture = optionalString(spec.fixture, "fixture", `project "${id}"`);
+      const name = optionalString(spec.name, "name", `project "${id}"`) ?? project ?? team ?? id;
+
+      if (fixture) {
+        return { id, name, source: fixtureSource(fixture), description: `file ${fixture}` };
+      }
+      const apiKeyEnv = optionalString(spec.apiKeyEnv, "apiKeyEnv", `project "${id}"`) ?? "LINEAR_API_KEY";
+      if (!API_KEY_ENV_PATTERN.test(apiKeyEnv)) {
+        throw new Error(`project "${id}": "apiKeyEnv" must match ${API_KEY_ENV_PATTERN}`);
+      }
+      const apiKey = env[apiKeyEnv]?.trim();
+      if (!apiKey) {
+        throw new Error(`project "${id}" requires environment variable ${apiKeyEnv}`);
+      }
+      return {
+        id,
+        name,
+        source: linearSource({ apiKey, team, project, fetchImpl: options.fetchImpl }),
+        description: `Linear (key ${apiKeyEnv}, team ${team ?? "any"}, project ${project ?? "any"})`,
+      };
+    });
+  }
+
+  const fixture = env.GRAPH_FIXTURE?.trim() || undefined;
+  const apiKey = env.LINEAR_API_KEY?.trim() || undefined;
+  const team = env.LINEAR_TEAM?.trim() || undefined;
+  const project = env.LINEAR_PROJECT?.trim() || undefined;
+  if (!fixture && !apiKey) {
+    throw new Error(
+      "LINEAR_API_KEY is not set (or set LINEAR_GRAPHS / LINEAR_GRAPHS_FILE, or GRAPH_FIXTURE to try without Linear)",
+    );
+  }
+  return [
+    {
+      id: "default",
+      name: project ?? team ?? "Linear issues",
+      source: fixture ? fixtureSource(fixture) : linearSource({ apiKey: apiKey!, team, project, fetchImpl: options.fetchImpl }),
+      description: fixture ? `the file ${fixture}` : `Linear (team ${team ?? "any"}, project ${project ?? "any"})`,
+    },
+  ];
+}
+
+// ---------------------------------------------------------------------------
 // The server
 // ---------------------------------------------------------------------------
 
-export type AppOptions = {
-  /** Where the issues come from: linearSource(...) or fixtureSource(...). */
-  source: () => Promise<LinearIssue[]>;
+export type AppOptions = (
+  | {
+      /** Single source shorthand: linearSource(...) or fixtureSource(...). */
+      source: () => Promise<LinearIssue[]>;
+      projects?: undefined;
+    }
+  | {
+      /** One or more named project graphs, each with its own cache and source. */
+      projects: ProjectEntry[];
+      source?: undefined;
+    }
+) & {
   /** How old the copy may get before the next request re-reads the source. Default 120. */
   refreshSeconds?: number;
   /** Shortest time between two reads of the source. Default 10. */
@@ -696,12 +830,48 @@ const PAGE_HEADERS = {
   "cache-control": "no-cache",
 };
 
+type ProjectState = {
+  id: string;
+  name: string;
+  source: () => Promise<LinearIssue[]>;
+  issues: LinearIssue[] | null;
+  graphs: Map<string, Graph>;
+  lastSync: number | null;
+  lastAttempt: number | null;
+  syncError: string | null;
+  running: Promise<void> | null;
+};
+
 export function createApp(options: AppOptions): Server {
   const refreshMs = (options.refreshSeconds ?? 120) * 1000;
   const minRefreshMs = (options.minRefreshSeconds ?? 10) * 1000;
   const publicDir = options.publicDir ?? join(dirname(fileURLToPath(import.meta.url)), "public");
   const log = options.log ?? ((line: string) => console.log(line));
   const now = options.now ?? (() => Date.now());
+
+  const projectEntries: ProjectEntry[] =
+    options.projects ?? [{ id: "default", name: "Linear issues", source: options.source! }];
+  if (projectEntries.length === 0) throw new Error("at least one project is required");
+
+  const projectStates: ProjectState[] = [];
+  const projectMap = new Map<string, ProjectState>();
+  for (const entry of projectEntries) {
+    if (projectMap.has(entry.id)) throw new Error(`duplicate project id "${entry.id}"`);
+    const state: ProjectState = {
+      id: entry.id,
+      name: entry.name,
+      source: entry.source,
+      issues: null,
+      graphs: new Map<string, Graph>(),
+      lastSync: null,
+      lastAttempt: null,
+      syncError: null,
+      running: null,
+    };
+    projectStates.push(state);
+    projectMap.set(entry.id, state);
+  }
+  const projectSummaries = projectStates.map(({ id, name }) => ({ id, name }));
 
   // The whole page is two files, read once. Nothing else on disk can be asked for.
   const index = readFileSync(join(publicDir, "index.html"));
@@ -712,37 +882,37 @@ export function createApp(options: AppOptions): Server {
     ["/app.js", { type: "text/javascript; charset=utf-8", body: script }],
   ]);
 
-  let issues: LinearIssue[] | null = null; // the last good read
-  const graphs = new Map<string, Graph>(); // the graph for each way of drawing it, built when first asked for
-  let lastSync: number | null = null; // when the source was last read successfully
-  let lastAttempt: number | null = null;
-  let syncError: string | null = null;
-  let running: Promise<void> | null = null;
-
-  /** Read the source once. Calls made while one is running share it. */
-  const refresh = (): Promise<void> => {
-    if (running) return running;
-    lastAttempt = now();
-    running = options
+  /** Read one project's source once. Calls made while one is running share it. */
+  const refresh = (state: ProjectState): Promise<void> => {
+    if (state.running) return state.running;
+    state.lastAttempt = now();
+    state.running = state
       .source()
       .then((read) => {
-        issues = read;
-        graphs.clear();
-        lastSync = now();
-        syncError = null;
+        state.issues = read;
+        state.graphs.clear();
+        state.lastSync = now();
+        state.syncError = null;
       })
       .catch((error: unknown) => {
         // The last good graph is kept, so a Linear outage shows old data instead of nothing.
-        syncError = error instanceof Error ? error.message : String(error);
-        log(`sync failed: ${syncError}`);
+        state.syncError = error instanceof Error ? error.message : String(error);
+        log(`sync failed (${state.id}): ${state.syncError}`);
       })
       .finally(() => {
-        running = null;
+        state.running = null;
       });
-    return running;
+    return state.running;
   };
 
-  const tooSoon = (): boolean => lastAttempt !== null && now() - lastAttempt < minRefreshMs;
+  const tooSoon = (state: ProjectState): boolean =>
+    state.lastAttempt !== null && now() - state.lastAttempt < minRefreshMs;
+
+  const resolveProject = (url: URL): ProjectState | null => {
+    const asked = url.searchParams.get("project");
+    if (!asked) return projectStates[0];
+    return projectMap.get(asked) ?? null;
+  };
 
   /** The statuses named in ?collapse=done,blocked. Anything that is not a status is ignored. */
   const collapsedIn = (url: URL): Status[] => {
@@ -752,20 +922,27 @@ export function createApp(options: AppOptions): Server {
 
   const flowIn = (url: URL): Flow => (url.searchParams.get("flow") === "right" ? "right" : "down");
 
-  const sendGraph = (res: ServerResponse, url: URL, extra: Record<string, unknown> = {}): void => {
-    if (!issues) {
-      sendJson(res, 503, { error: syncError ?? "the issues have not been read yet" });
+  const sendGraph = (
+    res: ServerResponse,
+    state: ProjectState,
+    url: URL,
+    extra: Record<string, unknown> = {},
+  ): void => {
+    if (!state.issues) {
+      sendJson(res, 503, { error: state.syncError ?? "the issues have not been read yet" });
       return;
     }
     const collapsed = collapsedIn(url);
     const flow = flowIn(url);
     const key = `${flow}|${collapsed.join(",")}`;
-    if (!graphs.has(key)) graphs.set(key, buildGraph(issues, { collapse: collapsed, flow }));
+    if (!state.graphs.has(key)) state.graphs.set(key, buildGraph(state.issues, { collapse: collapsed, flow }));
     sendJson(res, 200, {
-      ...graphs.get(key)!,
+      ...state.graphs.get(key)!,
+      project: { id: state.id, name: state.name },
+      projects: projectSummaries,
       collapsed,
-      lastSync: new Date(lastSync!).toISOString(),
-      syncError,
+      lastSync: new Date(state.lastSync!).toISOString(),
+      syncError: state.syncError,
       refreshSeconds: refreshMs / 1000,
       ...extra,
     });
@@ -782,19 +959,33 @@ export function createApp(options: AppOptions): Server {
       res.writeHead(200, { "content-type": "text/plain", "cache-control": "no-store" }).end("ok\n");
       return;
     }
+    if (path === "/api/projects" && read) {
+      sendJson(res, 200, { projects: projectSummaries });
+      return;
+    }
     if (path === "/api/graph" && read) {
-      if (!issues) {
-        if (!tooSoon() || running) await refresh();
-      } else if (now() - lastSync! > refreshMs && !running && !tooSoon()) {
-        void refresh(); // answer with the old copy now; the next request gets the new one
+      const state = resolveProject(url);
+      if (!state) {
+        sendJson(res, 404, { error: "unknown project" });
+        return;
       }
-      sendGraph(res, url);
+      if (!state.issues) {
+        if (!tooSoon(state) || state.running) await refresh(state);
+      } else if (now() - state.lastSync! > refreshMs && !state.running && !tooSoon(state)) {
+        void refresh(state); // answer with the old copy now; the next request gets the new one
+      }
+      sendGraph(res, state, url);
       return;
     }
     if (path === "/api/refresh" && method === "POST") {
-      const throttled = !running && tooSoon();
-      if (!throttled) await refresh();
-      sendGraph(res, url, { throttled });
+      const state = resolveProject(url);
+      if (!state) {
+        sendJson(res, 404, { error: "unknown project" });
+        return;
+      }
+      const throttled = !state.running && tooSoon(state);
+      if (!throttled) await refresh(state);
+      sendGraph(res, state, url, { throttled });
       return;
     }
     const file = files.get(path);
@@ -803,7 +994,7 @@ export function createApp(options: AppOptions): Server {
       res.end(method === "HEAD" ? undefined : file.body);
       return;
     }
-    if (file || path === "/healthz" || path === "/api/graph" || path === "/api/refresh") {
+    if (file || path === "/healthz" || path === "/api/projects" || path === "/api/graph" || path === "/api/refresh") {
       sendJson(res, 405, { error: `${method} is not allowed on ${path}` });
       return;
     }
@@ -849,18 +1040,19 @@ if (isMain()) {
   const port = Number(process.env.PORT ?? 8080);
   const host = process.env.HOST || "0.0.0.0";
   const refreshSeconds = Number(process.env.REFRESH_SECONDS ?? 120);
-  const fixture = process.env.GRAPH_FIXTURE;
-  const apiKey = process.env.LINEAR_API_KEY;
-  const team = process.env.LINEAR_TEAM || undefined;
-  const project = process.env.LINEAR_PROJECT || undefined;
-  if (!fixture && !apiKey) {
-    console.error("LINEAR_API_KEY is not set (or set GRAPH_FIXTURE to a JSON file to try the page without Linear)");
+  let projects: ProjectEntry[];
+  try {
+    projects = loadProjects(process.env);
+  } catch (error: unknown) {
+    console.error(error instanceof Error ? error.message : String(error));
     process.exit(1);
   }
-  const source = fixture ? fixtureSource(fixture) : linearSource({ apiKey: apiKey!, team, project });
-  const server = createApp({ source, refreshSeconds });
+  const server = createApp({ projects, refreshSeconds });
   server.listen(port, host, () => {
-    const from = fixture ? `the file ${fixture}` : `Linear (team ${team ?? "any"}, project ${project ?? "any"})`;
+    const from =
+      projects.length === 1
+        ? projects[0].description ?? projects[0].name
+        : `${projects.length} projects (${projects.map((p) => p.id).join(", ")})`;
     console.log(`linear-graph on ${host}:${port}, reading ${from}, refreshing after ${refreshSeconds}s`);
   });
   for (const signal of ["SIGTERM", "SIGINT"] as const) {

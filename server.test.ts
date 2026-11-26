@@ -8,7 +8,16 @@ import assert from "node:assert/strict";
 import type { AddressInfo } from "node:net";
 import { test } from "node:test";
 
-import { buildGraph, createApp, linearSource, type Graph, type GraphNode, type LinearIssue } from "./server.ts";
+import {
+  buildGraph,
+  createApp,
+  linearSource,
+  loadProjects,
+  type Graph,
+  type GraphNode,
+  type LinearIssue,
+  type ProjectEntry,
+} from "./server.ts";
 
 // --- Making issues -----------------------------------------------------------
 
@@ -599,5 +608,172 @@ test("/healthz says ok even when Linear cannot be read", async () => {
     assert.equal(app.reads(), 0); // the health check never reads Linear
   } finally {
     await app.close();
+  }
+});
+
+// --- Multi-project configuration & server -------------------------------------
+
+test("loadProjects supports LINEAR_GRAPHS with separate API keys, filters, and fixtures", async () => {
+  const requests: { auth: string | null; filter: unknown }[] = [];
+  const fetchImpl = (async (_url: unknown, init?: RequestInit) => {
+    const headers = init?.headers as Record<string, string>;
+    const body = JSON.parse(String(init?.body)) as { variables: { filter: unknown } };
+    requests.push({ auth: headers.authorization ?? null, filter: body.variables.filter });
+    return new Response(
+      JSON.stringify({ data: { issues: { nodes: [issue(1)], pageInfo: { hasNextPage: false, endCursor: null } } } }),
+      { status: 200 },
+    );
+  }) as unknown as typeof fetch;
+
+  const projects = loadProjects(
+    {
+      LINEAR_API_KEY: "key-default",
+      LINEAR_API_KEY_OTHER: "key-other",
+      LINEAR_GRAPHS: JSON.stringify([
+        { id: "alpha", name: "Alpha Board", team: "ALP", project: "Alpha Project" },
+        { id: "beta", apiKeyEnv: "LINEAR_API_KEY_OTHER", team: "BET" },
+        { id: "local", name: "Sample", fixture: "sample.json" },
+      ]),
+    },
+    { fetchImpl },
+  );
+
+  assert.deepEqual(
+    projects.map((p) => ({ id: p.id, name: p.name })),
+    [
+      { id: "alpha", name: "Alpha Board" },
+      { id: "beta", name: "BET" },
+      { id: "local", name: "Sample" },
+    ],
+  );
+
+  await projects[0].source();
+  await projects[1].source();
+  assert.deepEqual(requests, [
+    { auth: "key-default", filter: { team: { key: { eq: "ALP" } }, project: { name: { eq: "Alpha Project" } } } },
+    { auth: "key-other", filter: { team: { key: { eq: "BET" } } } },
+  ]);
+});
+
+test("loadProjects supports LINEAR_GRAPHS_FILE and legacy single-project env", () => {
+  const fromFile = loadProjects(
+    { LINEAR_GRAPHS_FILE: "/etc/graphs.json", LINEAR_API_KEY_WORK: "key-work" },
+    { readConfigFile: () => JSON.stringify([{ id: "work", apiKeyEnv: "LINEAR_API_KEY_WORK", project: "Work" }]) },
+  );
+  assert.deepEqual(
+    fromFile.map((p) => ({ id: p.id, name: p.name })),
+    [{ id: "work", name: "Work" }],
+  );
+
+  const legacy = loadProjects({ LINEAR_API_KEY: "k", LINEAR_TEAM: "CS1", LINEAR_PROJECT: "Final" });
+  assert.deepEqual(
+    legacy.map((p) => ({ id: p.id, name: p.name })),
+    [{ id: "default", name: "Final" }],
+  );
+});
+
+test("loadProjects rejects invalid configs and disallowed apiKeyEnv names", () => {
+  assert.throws(() => loadProjects({}), /LINEAR_API_KEY is not set/);
+  assert.throws(
+    () => loadProjects({ LINEAR_GRAPHS: "[]", LINEAR_GRAPHS_FILE: "/x.json" }),
+    /not both/,
+  );
+  assert.throws(() => loadProjects({ LINEAR_GRAPHS: "not json" }), /could not parse/);
+  assert.throws(() => loadProjects({ LINEAR_GRAPHS: "[]" }), /non-empty JSON array/);
+  assert.throws(
+    () => loadProjects({ LINEAR_API_KEY: "k", LINEAR_GRAPHS: JSON.stringify([{ id: "Bad Id" }]) }),
+    /"id" must match/,
+  );
+  assert.throws(
+    () => loadProjects({ LINEAR_API_KEY: "k", LINEAR_GRAPHS: JSON.stringify([{ id: "dup" }, { id: "dup" }]) }),
+    /duplicate project id/,
+  );
+  assert.throws(
+    () => loadProjects({ PATH: "/bin", LINEAR_GRAPHS: JSON.stringify([{ id: "a", apiKeyEnv: "PATH" }]) }),
+    /"apiKeyEnv" must match/,
+  );
+  assert.throws(
+    () => loadProjects({ LINEAR_GRAPHS: JSON.stringify([{ id: "a", apiKeyEnv: "LINEAR_API_KEY_MISSING" }]) }),
+    /requires environment variable LINEAR_API_KEY_MISSING/,
+  );
+});
+
+test("multi-project server lists projects, routes ?project=, and isolates caches and failures", async () => {
+  let readsA = 0;
+  let readsB = 0;
+  let clock = 1_000_000;
+  const projects: ProjectEntry[] = [
+    {
+      id: "alpha",
+      name: "Alpha Project",
+      source: async () => {
+        readsA++;
+        return [issue(1, { project: "Alpha Project" })];
+      },
+    },
+    {
+      id: "beta",
+      name: "Beta Project",
+      source: async () => {
+        readsB++;
+        if (readsB === 1) throw new Error("Linear refused the API key (HTTP 401)");
+        return [issue(2, { project: "Beta Project" }), issue(3, { project: "Beta Project" })];
+      },
+    },
+  ];
+  const server = createApp({ projects, refreshSeconds: 120, minRefreshSeconds: 10, log: () => {}, now: () => clock });
+  await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+  const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+
+  try {
+    const list = await fetch(`${url}/api/projects`);
+    assert.equal(list.status, 200);
+    assert.deepEqual(await list.json(), {
+      projects: [
+        { id: "alpha", name: "Alpha Project" },
+        { id: "beta", name: "Beta Project" },
+      ],
+    });
+    assert.equal((await fetch(`${url}/api/projects`, { method: "POST" })).status, 405);
+
+    // Default graph is the first project.
+    const def = await (await fetch(`${url}/api/graph`)).json();
+    assert.deepEqual(def.project, { id: "alpha", name: "Alpha Project" });
+    assert.deepEqual(
+      def.nodes.map((n: GraphNode) => n.id),
+      ["T-1"],
+    );
+    assert.equal(readsA, 1);
+    assert.equal(readsB, 0);
+
+    // Unknown project returns 404 on both /api/graph and /api/refresh.
+    assert.equal((await fetch(`${url}/api/graph?project=nope`)).status, 404);
+    assert.equal((await fetch(`${url}/api/refresh?project=nope`, { method: "POST" })).status, 404);
+
+    // Failing second project returns 503 without breaking the first.
+    const failedBeta = await fetch(`${url}/api/graph?project=beta`);
+    assert.equal(failedBeta.status, 503);
+    assert.equal((await fetch(`${url}/api/graph?project=alpha`)).status, 200);
+    assert.equal(readsA, 1);
+    assert.equal(readsB, 1);
+
+    // After throttle window, refreshing beta recovers beta without touching alpha.
+    clock += 11_000;
+    const recoveredBeta = await (await fetch(`${url}/api/refresh?project=beta`, { method: "POST" })).json();
+    assert.equal(recoveredBeta.throttled, false);
+    assert.deepEqual(recoveredBeta.project, { id: "beta", name: "Beta Project" });
+    assert.equal(recoveredBeta.nodes.length, 2);
+    assert.equal(readsA, 1);
+    assert.equal(readsB, 2);
+
+    // Refreshing alpha right away is NOT blocked by beta's refresh.
+    const refreshedAlpha = await (await fetch(`${url}/api/refresh?project=alpha`, { method: "POST" })).json();
+    assert.equal(refreshedAlpha.throttled, false);
+    assert.equal(readsA, 2);
+  } finally {
+    await new Promise<void>((done) => {
+      server.close(() => done());
+      server.closeAllConnections();
+    });
   }
 });
