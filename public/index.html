@@ -121,11 +121,18 @@
   .tool-group { display: inline-flex; align-items: center; gap: 5px; }
   .tool-group .label { font-size: 11px; color: var(--muted); }
   .warning { color: var(--blocked); }
+  /* Sideways-scrolling strips fade at whichever edge still has more to show. */
+  .fade-r { -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 36px), transparent); mask-image: linear-gradient(to right, #000 calc(100% - 36px), transparent); }
+  .fade-l { -webkit-mask-image: linear-gradient(to right, transparent, #000 36px); mask-image: linear-gradient(to right, transparent, #000 36px); }
+  .fade-l.fade-r {
+    -webkit-mask-image: linear-gradient(to right, transparent, #000 36px, #000 calc(100% - 36px), transparent);
+    mask-image: linear-gradient(to right, transparent, #000 36px, #000 calc(100% - 36px), transparent);
+  }
 
   /* Ready-to-start popover */
   .ready-wrap { position: relative; }
   #ready-pop {
-    position: absolute; left: 0; top: calc(100% + 6px); z-index: 40;
+    position: fixed; left: 12px; top: 120px; z-index: 40;
     width: 360px; max-width: calc(100vw - 24px); max-height: 340px; overflow: auto; padding: 6px;
     background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
     box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
@@ -163,6 +170,8 @@
     user-select: none; -webkit-user-select: none;
     background-image: radial-gradient(circle, var(--line) 1px, transparent 1.5px);
   }
+  /* Every finger gesture on the graph is the page's own pan and zoom, never the browser's page zoom. */
+  #stage, #stage * { touch-action: none; }
   #stage.dragging, #stage.dragging .card, #stage.dragging .pin { cursor: grabbing; }
   #canvas { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
   #canvas.gliding { transition: transform .25s ease; }
@@ -298,8 +307,15 @@
     header select { flex: 1 1 auto; max-width: none; font-size: 13px; padding: 6px 8px; }
     header button { padding: 6px 10px; min-height: 34px; }
     #summary { padding: 6px 12px; }
-    #notes { padding: 6px 12px; gap: 6px 8px; }
-    .legend { margin-left: 0; width: 100%; padding-bottom: 1px; }
+    /* One sideways-scrolling toolbar row instead of two wrapped rows, to leave the graph more room. */
+    #notes {
+      padding: 6px 12px; gap: 6px 8px; flex-wrap: nowrap; overflow-x: auto;
+      -webkit-overflow-scrolling: touch; scrollbar-width: none;
+    }
+    #notes::-webkit-scrollbar, #summary::-webkit-scrollbar { display: none; }
+    #notes > * { flex: none; }
+    .legend { margin-left: 0; overflow: visible; }
+    .warning { white-space: nowrap; }
     .tool-btn, .tool-select { padding: 5px 9px; min-height: 30px; }
     .controls button { width: 40px; height: 38px; font-size: 18px; }
     #zoom-fit { font-size: 12px; }
@@ -310,8 +326,11 @@
       padding: 14px 16px calc(16px + env(safe-area-inset-bottom));
     }
   }
-  @media (max-width: 640px) {
+  /* Phones, and anything too short for the small map to leave the graph room (a phone on its side). */
+  @media (max-width: 640px), (max-height: 500px) {
     #minimap { display: none !important; }
+  }
+  @media (max-width: 640px) {
     #sync { font-size: 11px; }
   }
 </style>

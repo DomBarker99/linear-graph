@@ -38,6 +38,7 @@
 //
 // Node runs this file directly (type stripping): no build step, no dependencies.
 
+import { createHash } from "node:crypto";
 import { readFileSync, realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
@@ -947,6 +948,9 @@ export function createApp(options: AppOptions): Server {
     ["/index.html", { type: "text/html; charset=utf-8", body: index }],
     ["/app.js", { type: "text/javascript; charset=utf-8", body: script }],
   ]);
+  // Changes whenever the page changes. An open page that sees a different one reloads itself,
+  // so a tab left open across a deploy never draws new data with old code.
+  const appVersion = createHash("sha256").update(index).update(script).digest("hex").slice(0, 12);
 
   /** Read one project's source once. Calls made while one is running share it. */
   const refresh = (state: ProjectState): Promise<void> => {
@@ -1010,6 +1014,7 @@ export function createApp(options: AppOptions): Server {
       lastSync: new Date(state.lastSync!).toISOString(),
       syncError: state.syncError,
       refreshSeconds: refreshMs / 1000,
+      appVersion,
       ...extra,
     });
   };
@@ -1026,7 +1031,7 @@ export function createApp(options: AppOptions): Server {
       return;
     }
     if (path === "/api/projects" && read) {
-      sendJson(res, 200, { projects: projectSummaries });
+      sendJson(res, 200, { projects: projectSummaries, appVersion });
       return;
     }
     if (path === "/api/graph" && read) {

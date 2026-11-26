@@ -79,6 +79,8 @@ let layout = null;
 let projects = [];
 let activeProject = new URLSearchParams(location.search).get("project") || null;
 let loadSeq = 0;
+// The server's page version when this page loaded. A different one later means a deploy happened.
+let pageVersion = null;
 // What is selected: an issue ("CS1-14") or a collapsed status's dot ("group:done").
 let selected = decodeURIComponent(location.hash.slice(1)) || null;
 // Active milestone filter (milestone id, or null for all).
@@ -258,6 +260,7 @@ async function init() {
     const response = await fetch("/api/projects");
     if (response.ok) {
       const body = await response.json();
+      pageVersion = body.appVersion ?? null;
       projects = Array.isArray(body.projects) ? body.projects : [];
       const fromUrl = new URLSearchParams(location.search).get("project");
       const fromStorage = stored(PROJECT_KEY, null);
@@ -286,6 +289,12 @@ async function load(refresh = false) {
     const body = await response.json();
     if (seq !== loadSeq) return;
     if (!response.ok) throw new Error(body.error ?? `HTTP ${response.status}`);
+    // A new version was deployed since this page loaded: reload rather than draw new data with old code.
+    if (body.appVersion && pageVersion && body.appVersion !== pageVersion) {
+      location.reload();
+      return;
+    }
+    pageVersion ??= body.appVersion ?? null;
     if (Array.isArray(body.projects) && JSON.stringify(body.projects) !== JSON.stringify(projects)) {
       projects = body.projects;
       drawProjects();
@@ -715,16 +724,28 @@ function drawSummary() {
     makePill("All", graph.totals),
     ...graph.milestones.map((m) => makePill(m.name, m, { msId: m.id, date: m.targetDate })),
   );
+  updateScrollFade(view.summary);
+}
+
+/** Fade a scrollable strip's edges only where more content is hidden, so a cut-off pill reads as "scroll for more". */
+function updateScrollFade(strip) {
+  const more = strip.scrollWidth - strip.clientWidth > 2;
+  strip.classList.toggle("fade-l", more && strip.scrollLeft > 2);
+  strip.classList.toggle("fade-r", more && strip.scrollLeft + strip.clientWidth < strip.scrollWidth - 2);
 }
 
 function drawNotes() {
   const parts = [];
   const ready = graph.nodes.filter((node) => node.ready);
 
+  $("ready-pop")?.remove();
   if (ready.length > 0) {
     const wrap = el("div", { class: "ready-wrap" });
     const btn = el("button", { class: "tool-btn", type: "button", text: `Ready (${ready.length}) ▾` });
+    // The list lives on <body>, not in the toolbar: the toolbar scrolls sideways and fades its edges,
+    // and either would clip anything inside it.
     const pop = el("div", { id: "ready-pop", hidden: true });
+    document.body.append(pop);
     for (const node of ready) {
       const row = el("button", { class: "ready-row", type: "button" }, [
         el("span", { class: "dot", style: `background:${milestoneColour(node.milestone)}` }),
@@ -741,8 +762,13 @@ function drawNotes() {
     btn.addEventListener("click", (event) => {
       event.stopPropagation();
       pop.hidden = !pop.hidden;
+      if (pop.hidden) return;
+      const r = btn.getBoundingClientRect();
+      pop.style.top = `${r.bottom + 6}px`;
+      if (window.innerWidth <= 720) Object.assign(pop.style, { left: "12px", right: "12px", width: "auto" });
+      else Object.assign(pop.style, { left: `${Math.max(12, r.left)}px`, right: "auto", width: "" });
     });
-    wrap.append(btn, pop);
+    wrap.append(btn);
     parts.push(wrap);
   }
 
@@ -794,6 +820,7 @@ function drawNotes() {
     ),
   );
   view.notes.replaceChildren(...parts);
+  updateScrollFade(view.notes);
 }
 
 /** Everything the selected issue waits on, and everything that waits on it. */
@@ -1051,14 +1078,46 @@ function zoomAtCentre(factor) {
   zoomAt(view.stage.clientWidth / 2, view.stage.clientHeight / 2, viewport.k * factor, true);
 }
 
+/** The zoom buttons and the small map, as boxes in stage coordinates (with a little breathing room). */
+function overlayBoxes() {
+  const stage = view.stage.getBoundingClientRect();
+  const boxes = [];
+  for (const part of [document.querySelector(".controls"), view.minimap]) {
+    if (!part || getComputedStyle(part).display === "none") continue;
+    const r = part.getBoundingClientRect();
+    if (!r.width || !r.height) continue;
+    boxes.push({ l: r.left - stage.left - 10, t: r.top - stage.top - 10, r: r.right - stage.left + 10, b: r.bottom - stage.top + 10 });
+  }
+  return boxes;
+}
+
+/**
+ * Show the whole graph, as large as fits (never larger than full size), without letting the
+ * zoom buttons or the small map sit on top of any of it.
+ */
 function fit(animate = true) {
   const width = view.stage.clientWidth;
   const height = view.stage.clientHeight;
   if (!world.width || !width || !height) return;
-  const k = Math.min(1, (width - FIT_MARGIN) / world.width, (height - FIT_MARGIN) / world.height);
-  viewport.k = Math.max(MIN_ZOOM, k);
-  viewport.x = (width - world.width * viewport.k) / 2;
-  viewport.y = Math.min(48, Math.max(12, (height - world.height * viewport.k) / 2));
+  const place = (l, t, w, h) => {
+    const k = Math.max(MIN_ZOOM, Math.min(1, (w - FIT_MARGIN) / world.width, (h - FIT_MARGIN) / world.height));
+    const x = l + (w - world.width * k) / 2;
+    const y = t + Math.min(48, Math.max(12, (h - world.height * k) / 2));
+    return { k, x, y };
+  };
+  const covers = (v, boxes) =>
+    boxes.some((o) => v.x < o.r && o.l < v.x + world.width * v.k && v.y < o.b && o.t < v.y + world.height * v.k);
+  const overlays = overlayBoxes();
+  let best = place(0, 0, width, height);
+  if (covers(best, overlays)) {
+    // Either keep clear of the overlays' band along the bottom, or of their columns at the sides.
+    const top = Math.min(...overlays.map((o) => o.t));
+    const left = Math.max(0, ...overlays.filter((o) => o.l < width / 2).map((o) => o.r));
+    const right = Math.min(width, ...overlays.filter((o) => o.l >= width / 2).map((o) => o.l));
+    const options = [place(0, 0, width, top), place(left, 0, right - left, height)].filter((v) => !covers(v, overlays));
+    if (options.length) best = options.reduce((a, b) => (b.k > a.k ? b : a));
+  }
+  Object.assign(viewport, best);
   fitted = true;
   applyViewport(animate);
 }
@@ -1087,7 +1146,8 @@ function drawMinimap() {
     ...[...layout.placed.entries()].map(([id, place]) => {
       const item = thing(id);
       const dot = isGroup(id);
-      const grow = dot ? 14 : 0;
+      // A dot is drawn larger than life on the map so it does not vanish, but in proportion to the sheet.
+      const grow = dot ? Math.min(14, Math.max(world.width, world.height) * 0.02) : 0;
       return svg("rect", {
         class: `${item.status}${id === selected ? " selected" : ""}`,
         x: place.left - grow,
@@ -1187,6 +1247,21 @@ function select(id, scroll = false) {
   drawGraph();
   drawDetail();
   if (id && scroll) centreOn(id);
+  else if (id) keepAboveSheet(id);
+}
+
+/** On a phone the detail panel is a sheet over the bottom of the graph; slide the chosen card up out from under it. */
+function keepAboveSheet(id) {
+  if (window.innerWidth > 720 || view.detail.hidden) return;
+  const card = drawn.get(drawnIdOf(id))?.element;
+  if (!card) return;
+  const c = card.getBoundingClientRect();
+  const sheetTop = view.detail.getBoundingClientRect().top;
+  const stageTop = view.stage.getBoundingClientRect().top;
+  if (c.bottom <= sheetTop - 8 && c.top >= stageTop) return;
+  viewport.y += (stageTop + sheetTop) / 2 - (c.top + c.bottom) / 2;
+  fitted = false;
+  applyViewport(true);
 }
 
 // --- Wiring (mouse + multi-touch pinch/pan) --------------------------------
@@ -1215,6 +1290,8 @@ view.zoomIn.addEventListener("click", () => zoomAtCentre(ZOOM_STEP));
 view.zoomOut.addEventListener("click", () => zoomAtCentre(1 / ZOOM_STEP));
 view.zoomFit.addEventListener("click", () => fit());
 view.flow.addEventListener("click", toggleFlow);
+
+for (const strip of [view.summary, view.notes]) strip.addEventListener("scroll", () => updateScrollFade(strip), { passive: true });
 
 // Close the Ready popover on outside click.
 document.addEventListener("click", () => {
@@ -1333,6 +1410,14 @@ for (const type of ["pointerup", "pointercancel"]) {
   });
 }
 
+// touch-action alone does not stop every browser (iOS Safari in particular) from zooming the whole
+// page on a pinch, so cancel the browser's own handling of moves and gestures on the graph. Taps
+// are left alone so cards stay clickable; pointer events still arrive for our own pan and zoom.
+view.stage.addEventListener("touchmove", (event) => event.preventDefault(), { passive: false });
+for (const type of ["gesturestart", "gesturechange", "gestureend"]) {
+  view.stage.addEventListener(type, (event) => event.preventDefault(), { passive: false });
+}
+
 view.stage.addEventListener(
   "click",
   (event) => {
@@ -1391,6 +1476,8 @@ let lastLayoutWidth = 0;
 new ResizeObserver(() => {
   if (!graph) return;
   showSync();
+  updateScrollFade(view.summary);
+  updateScrollFade(view.notes);
   const w = view.stage.clientWidth;
   if (w > 0 && Math.abs(w - lastLayoutWidth) > 80) {
     lastLayoutWidth = w;

@@ -785,16 +785,17 @@ test("multi-project server lists projects, routes ?project=, and isolates caches
   try {
     const list = await fetch(`${url}/api/projects`);
     assert.equal(list.status, 200);
-    assert.deepEqual(await list.json(), {
-      projects: [
-        { id: "alpha", name: "Alpha Project" },
-        { id: "beta", name: "Beta Project" },
-      ],
-    });
+    const listed = await list.json();
+    assert.deepEqual(listed.projects, [
+      { id: "alpha", name: "Alpha Project" },
+      { id: "beta", name: "Beta Project" },
+    ]);
+    assert.match(listed.appVersion, /^[0-9a-f]{12}$/);
     assert.equal((await fetch(`${url}/api/projects`, { method: "POST" })).status, 405);
 
-    // Default graph is the first project.
+    // Default graph is the first project, stamped with the same page version.
     const def = await (await fetch(`${url}/api/graph`)).json();
+    assert.equal(def.appVersion, listed.appVersion);
     assert.deepEqual(def.project, { id: "alpha", name: "Alpha Project" });
     assert.deepEqual(
       def.nodes.map((n: GraphNode) => n.id),
@@ -833,4 +834,29 @@ test("multi-project server lists projects, routes ?project=, and isolates caches
       server.closeAllConnections();
     });
   }
+});
+
+test("the page version changes when the page files change, so open tabs reload after a deploy", async () => {
+  const { mkdtempSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const versionFor = async (script: string): Promise<string> => {
+    const dir = mkdtempSync(join(tmpdir(), "lg-version-"));
+    writeFileSync(join(dir, "index.html"), "<!doctype html>");
+    writeFileSync(join(dir, "app.js"), script);
+    const server = createApp({ source: async () => [], publicDir: dir, log: () => {} });
+    await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+    try {
+      const { port } = server.address() as AddressInfo;
+      return (await (await fetch(`http://127.0.0.1:${port}/api/projects`)).json()).appVersion;
+    } finally {
+      await new Promise<void>((done) => {
+        server.close(() => done());
+        server.closeAllConnections();
+      });
+    }
+  };
+  const first = await versionFor("console.log(1)");
+  assert.equal(await versionFor("console.log(1)"), first);
+  assert.notEqual(await versionFor("console.log(2)"), first);
 });
