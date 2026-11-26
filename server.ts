@@ -167,9 +167,11 @@ export type GraphNode = {
   priority: number;
   /** Milestone id, or "none". */
   milestone: string;
-  /** How far along the flow, counted from 0. Each issue is one rank past the last thing that blocks it. */
+  /** Index into Graph.clusters, or null when this issue has no blocking lines (standalone). */
+  cluster: number | null;
+  /** How far along the flow within its cluster, counted from 0. Each issue is one rank past the last thing that blocks it. */
   rank: number;
-  /** Position across the flow, in card widths (or card heights when the flow runs left to right), 0 at the start. */
+  /** Position across the flow within its cluster, in card widths (or card heights when the flow runs left to right), 0 at the start. */
   across: number;
   done: boolean;
   /** Not done, and at least one issue that blocks it is not done. */
@@ -201,8 +203,21 @@ export type GraphGroup = {
   status: Status;
   /** The issues it stands for. */
   members: string[];
+  /** Index into Graph.clusters, or null if this dot has no blocking lines. */
+  cluster: number | null;
   rank: number;
   across: number;
+};
+
+export type GraphCluster = {
+  /** 0-based index of this connected component (sorted largest-first). */
+  id: number;
+  /** Shown items (issue ids and/or collapsed dots) belonging to this cluster. */
+  items: string[];
+  /** How many ranks this cluster has along the flow. */
+  ranks: number;
+  /** How far this cluster's widest rank reaches across, in the same unit as `across`. */
+  breadth: number;
 };
 
 export type GraphEdge = {
@@ -210,11 +225,13 @@ export type GraphEdge = {
   from: string;
   /** The issue it blocks, or the dot that is collapsed into. */
   to: string;
+  /** Index into Graph.clusters that holds both endpoints. */
+  cluster: number;
   /** Part of a loop (A blocks B blocks A). Drawn differently and left out of the layout. */
   cyclic: boolean;
   /** Not a relation in Linear: the two are linked only through collapsed issues in between. */
   via: boolean;
-  /** [rank, across] from source to target. Long lines get one point per rank they pass. */
+  /** [rank, across] from source to target within its cluster. Long lines get one point per rank they pass. */
   points: [number, number][];
 };
 
@@ -233,11 +250,15 @@ export type Graph = {
   nodes: GraphNode[];
   groups: GraphGroup[];
   edges: GraphEdge[];
+  /** Connected dependency components (each has >= 2 items), sorted largest-first. */
+  clusters: GraphCluster[];
+  /** Shown items (issue ids or collapsed dots) with no blocking lines at all. */
+  standalone: string[];
   milestones: Milestone[];
   totals: { total: number; done: number; started: number };
-  /** How many ranks the flow has. */
+  /** Largest rank count across clusters (or 1 when only standalone items exist, 0 if empty). */
   ranks: number;
-  /** How far the widest rank reaches across, in the same unit as `across`. */
+  /** Largest breadth across clusters (or standalone count when there are no clusters). */
   breadth: number;
   warnings: string[];
 };
@@ -410,175 +431,215 @@ export function buildGraph(issues: LinearIssue[], options: { collapse?: Iterable
 
   const after = new Map(items.map((item) => [item, outOf.get(item)!.filter((next) => !cyclic.has(`${item}>${next}`))]));
   const before = new Map(items.map((item) => [item, into.get(item)!.filter((prev) => !cyclic.has(`${prev}>${item}`))]));
-
-  // --- Ranks: one further along than the last thing that blocks it -------
-  const rank = new Map<string, number>();
-  const waitingOn = new Map(items.map((item) => [item, before.get(item)!.length]));
-  const queue = items.filter((item) => waitingOn.get(item) === 0);
-  for (let head = 0; head < queue.length; head++) {
-    const item = queue[head];
-    rank.set(item, Math.max(-1, ...before.get(item)!.map((prev) => rank.get(prev)!)) + 1);
-    for (const next of after.get(item)!) {
-      waitingOn.set(next, waitingOn.get(next)! - 1);
-      if (waitingOn.get(next) === 0) queue.push(next);
-    }
-  }
-  // Something nothing blocks would sit in the first rank with a long line to
-  // what it blocks. Move it next to that instead.
-  for (const item of items) {
-    if (before.get(item)!.length === 0 && after.get(item)!.length > 0) {
-      rank.set(item, Math.min(...after.get(item)!.map((next) => rank.get(next)!)) - 1);
-    }
-  }
-  const ranks = items.length === 0 ? 0 : Math.max(...rank.values()) + 1;
-
-  // --- Slots: every rank holds cards and dots, plus a thin slot for each line passing through
-  type Slot = { key: string; room: number };
-  const layers: Slot[][] = Array.from({ length: ranks }, () => []);
-  const backward = new Map<string, string[]>(); // slot -> slots it connects to in the rank before
-  const forward = new Map<string, string[]>(); // slot -> slots it connects to in the rank after
-  const connect = (a: string, b: string): void => {
-    forward.set(a, [...(forward.get(a) ?? []), b]);
-    backward.set(b, [...(backward.get(b) ?? []), a]);
-  };
   const milestoneOrder = (item: string): number =>
     isGroup(item) ? -1 : (issueOf.get(item)!.projectMilestone?.sortOrder ?? Number.MAX_VALUE);
-  for (const item of [...items].sort((a, b) => milestoneOrder(a) - milestoneOrder(b) || compareItems(a, b))) {
-    layers[rank.get(item)!].push({ key: item, room: isGroup(item) ? DOT_SLOT[flow] : CARD_SLOT });
+
+  // --- Connected components: split dependency clusters from standalone items
+  const visitedComp = new Set<string>();
+  const rawClusters: string[][] = [];
+  const standalone: string[] = [];
+  for (const startItem of items) {
+    if (visitedComp.has(startItem)) continue;
+    const comp: string[] = [];
+    const stack = [startItem];
+    visitedComp.add(startItem);
+    while (stack.length > 0) {
+      const current = stack.pop()!;
+      comp.push(current);
+      for (const neighbour of [...outOf.get(current)!, ...into.get(current)!]) {
+        if (!visitedComp.has(neighbour)) {
+          visitedComp.add(neighbour);
+          stack.push(neighbour);
+        }
+      }
+    }
+    comp.sort(compareItems);
+    if (comp.length >= 2) rawClusters.push(comp);
+    else standalone.push(comp[0]);
   }
+  standalone.sort((a, b) => milestoneOrder(a) - milestoneOrder(b) || compareItems(a, b));
+  // Largest clusters first; tie-break by earliest milestone then first identifier.
+  const clusterKey = (comp: string[]): number => Math.min(...comp.map(milestoneOrder));
+  rawClusters.sort((a, b) => b.length - a.length || clusterKey(a) - clusterKey(b) || compareItems(a[0], b[0]));
+
+  // --- Lay out each dependency cluster independently ----------------------
+  const clusterOf = new Map<string, number | null>(standalone.map((item) => [item, null]));
+  const rank = new Map<string, number>(standalone.map((item) => [item, 0]));
+  const across = new Map<string, number>(standalone.map((item) => [item, 0]));
   const passes = new Map<string, string[]>(); // line -> the thin slots it passes through
-  for (const from of items) {
-    for (const to of after.get(from)!) {
-      const through: string[] = [];
-      let previous = from;
-      for (let at = rank.get(from)! + 1; at < rank.get(to)!; at++) {
-        const key = `${from}>${to}@${at}`;
-        layers[at].push({ key, room: LINE_SLOT[flow] });
-        connect(previous, key);
-        through.push(key);
-        previous = key;
-      }
-      connect(previous, to);
-      passes.set(`${from}>${to}`, through);
-    }
-  }
+  const clusters: GraphCluster[] = [];
 
-  // --- Order within each rank: fewest crossing lines ---------------------
-  const position = new Map<string, number>();
-  const renumber = (): void => layers.forEach((layer) => layer.forEach((slot, index) => position.set(slot.key, index)));
-  const crossings = (): number => {
-    let count = 0;
-    for (let at = 0; at + 1 < layers.length; at++) {
-      const segments: [number, number][] = [];
-      for (const slot of layers[at]) {
-        for (const next of forward.get(slot.key) ?? []) segments.push([position.get(slot.key)!, position.get(next)!]);
+  for (let clusterIndex = 0; clusterIndex < rawClusters.length; clusterIndex++) {
+    const compItems = rawClusters[clusterIndex];
+    for (const item of compItems) clusterOf.set(item, clusterIndex);
+
+    // Ranks: one further along than the last thing that blocks it.
+    const waitingOn = new Map(compItems.map((item) => [item, before.get(item)!.length]));
+    const queue = compItems.filter((item) => waitingOn.get(item) === 0);
+    for (let head = 0; head < queue.length; head++) {
+      const item = queue[head];
+      rank.set(item, Math.max(-1, ...before.get(item)!.map((prev) => rank.get(prev)!)) + 1);
+      for (const next of after.get(item)!) {
+        waitingOn.set(next, waitingOn.get(next)! - 1);
+        if (waitingOn.get(next) === 0) queue.push(next);
       }
-      for (let a = 0; a < segments.length; a++) {
-        for (let b = a + 1; b < segments.length; b++) {
-          if ((segments[a][0] - segments[b][0]) * (segments[a][1] - segments[b][1]) < 0) count++;
+    }
+    // Something nothing blocks would sit in the first rank with a long line to
+    // what it blocks. Move it next to that instead.
+    for (const item of compItems) {
+      if (before.get(item)!.length === 0 && after.get(item)!.length > 0) {
+        rank.set(item, Math.min(...after.get(item)!.map((next) => rank.get(next)!)) - 1);
+      }
+    }
+    const compRanks = Math.max(...compItems.map((item) => rank.get(item)!)) + 1;
+
+    // Slots: every rank holds cards and dots, plus a thin slot for each line passing through.
+    type Slot = { key: string; room: number };
+    const layers: Slot[][] = Array.from({ length: compRanks }, () => []);
+    const backward = new Map<string, string[]>();
+    const forward = new Map<string, string[]>();
+    const connect = (a: string, b: string): void => {
+      forward.set(a, [...(forward.get(a) ?? []), b]);
+      backward.set(b, [...(backward.get(b) ?? []), a]);
+    };
+    for (const item of [...compItems].sort((a, b) => milestoneOrder(a) - milestoneOrder(b) || compareItems(a, b))) {
+      layers[rank.get(item)!].push({ key: item, room: isGroup(item) ? DOT_SLOT[flow] : CARD_SLOT });
+    }
+    for (const from of compItems) {
+      for (const to of after.get(from)!) {
+        const through: string[] = [];
+        let previous = from;
+        for (let at = rank.get(from)! + 1; at < rank.get(to)!; at++) {
+          const key = `${from}>${to}@${at}`;
+          layers[at].push({ key, room: LINE_SLOT[flow] });
+          connect(previous, key);
+          through.push(key);
+          previous = key;
+        }
+        connect(previous, to);
+        passes.set(`${from}>${to}`, through);
+      }
+    }
+
+    // Order within each rank: fewest crossing lines.
+    const position = new Map<string, number>();
+    const renumber = (): void => layers.forEach((layer) => layer.forEach((slot, index) => position.set(slot.key, index)));
+    const crossings = (): number => {
+      let count = 0;
+      for (let at = 0; at + 1 < layers.length; at++) {
+        const segments: [number, number][] = [];
+        for (const slot of layers[at]) {
+          for (const next of forward.get(slot.key) ?? []) segments.push([position.get(slot.key)!, position.get(next)!]);
+        }
+        for (let a = 0; a < segments.length; a++) {
+          for (let b = a + 1; b < segments.length; b++) {
+            if ((segments[a][0] - segments[b][0]) * (segments[a][1] - segments[b][1]) < 0) count++;
+          }
+        }
+      }
+      return count;
+    };
+    const reorder = (layer: Slot[], neighbours: Map<string, string[]>): void => {
+      const wanted = new Map(
+        layer.map((slot) => {
+          const near = neighbours.get(slot.key) ?? [];
+          return [slot.key, near.length ? mean(near.map((key) => position.get(key)!)) : position.get(slot.key)!];
+        }),
+      );
+      const was = new Map(layer.map((slot) => [slot.key, position.get(slot.key)!]));
+      layer.sort((a, b) => wanted.get(a.key)! - wanted.get(b.key)! || was.get(a.key)! - was.get(b.key)!);
+      layer.forEach((slot, index) => position.set(slot.key, index));
+    };
+    renumber();
+    let best = layers.map((layer) => [...layer]);
+    let fewest = crossings();
+    for (let round = 0; round < 12 && fewest > 0; round++) {
+      if (round % 2 === 0) for (let at = 1; at < layers.length; at++) reorder(layers[at], backward);
+      else for (let at = layers.length - 2; at >= 0; at--) reorder(layers[at], forward);
+      const now = crossings();
+      if (now < fewest) {
+        fewest = now;
+        best = layers.map((layer) => [...layer]);
+      }
+    }
+    best.forEach((layer, at) => (layers[at] = layer));
+    renumber();
+    const crossingsBetween = (first: string, second: string): number => {
+      let count = 0;
+      for (const neighbours of [backward, forward]) {
+        for (const a of neighbours.get(first) ?? []) {
+          for (const b of neighbours.get(second) ?? []) if (position.get(a)! > position.get(b)!) count++;
+        }
+      }
+      return count;
+    };
+    for (let pass = 0, swapped = true; swapped && pass < 20; pass++) {
+      swapped = false;
+      for (const layer of layers) {
+        for (let index = 0; index + 1 < layer.length; index++) {
+          const first = layer[index];
+          const second = layer[index + 1];
+          if (crossingsBetween(second.key, first.key) < crossingsBetween(first.key, second.key)) {
+            layer[index] = second;
+            layer[index + 1] = first;
+            position.set(second.key, index);
+            position.set(first.key, index + 1);
+            swapped = true;
+          }
         }
       }
     }
-    return count;
-  };
-  const reorder = (layer: Slot[], neighbours: Map<string, string[]>): void => {
-    const wanted = new Map(
-      layer.map((slot) => {
-        const near = neighbours.get(slot.key) ?? [];
-        return [slot.key, near.length ? mean(near.map((key) => position.get(key)!)) : position.get(slot.key)!];
-      }),
-    );
-    const was = new Map(layer.map((slot) => [slot.key, position.get(slot.key)!]));
-    layer.sort((a, b) => wanted.get(a.key)! - wanted.get(b.key)! || was.get(a.key)! - was.get(b.key)!);
-    layer.forEach((slot, index) => position.set(slot.key, index));
-  };
-  renumber();
-  let best = layers.map((layer) => [...layer]);
-  let fewest = crossings();
-  for (let round = 0; round < 12 && fewest > 0; round++) {
-    if (round % 2 === 0) for (let at = 1; at < layers.length; at++) reorder(layers[at], backward);
-    else for (let at = layers.length - 2; at >= 0; at--) reorder(layers[at], forward);
-    const now = crossings();
-    if (now < fewest) {
-      fewest = now;
-      best = layers.map((layer) => [...layer]);
-    }
-  }
-  best.forEach((layer, at) => (layers[at] = layer));
-  renumber();
-  // Then swap neighbours wherever that alone removes a crossing.
-  const crossingsBetween = (first: string, second: string): number => {
-    let count = 0;
-    for (const neighbours of [backward, forward]) {
-      for (const a of neighbours.get(first) ?? []) {
-        for (const b of neighbours.get(second) ?? []) if (position.get(a)! > position.get(b)!) count++;
+
+    // Place each slot across the flow: pull connected things into line.
+    const localAcross = new Map<string, number>();
+    const offsets = layers.map((layer) => {
+      const offset = [0];
+      for (let index = 1; index < layer.length; index++) {
+        offset.push(offset[index - 1] + (layer[index - 1].room + layer[index].room) / 2 + SLOT_GAP[flow]);
       }
-    }
-    return count;
-  };
-  for (let pass = 0, swapped = true; swapped && pass < 20; pass++) {
-    swapped = false;
-    for (const layer of layers) {
-      for (let index = 0; index + 1 < layer.length; index++) {
-        const first = layer[index];
-        const second = layer[index + 1];
-        if (crossingsBetween(second.key, first.key) < crossingsBetween(first.key, second.key)) {
-          layer[index] = second;
-          layer[index + 1] = first;
-          position.set(second.key, index);
-          position.set(first.key, index + 1);
-          swapped = true;
+      return offset;
+    });
+    layers.forEach((layer, at) => {
+      const middle = (offsets[at][layer.length - 1] ?? 0) / 2;
+      layer.forEach((slot, index) => localAcross.set(slot.key, offsets[at][index] - middle));
+    });
+    const settle = (at: number, neighbours: (key: string) => string[]): void => {
+      const layer = layers[at];
+      const shift: (number | null)[] = layer.map((slot, index) => {
+        const near = neighbours(slot.key);
+        return near.length ? mean(near.map((key) => localAcross.get(key)!)) - offsets[at][index] : null;
+      });
+      if (shift.every((value) => value === null)) return;
+      const wished = shift.map((value, index) => {
+        for (let distance = 0; value === null && distance < layer.length; distance++) {
+          value = shift[index - distance] ?? shift[index + distance] ?? null;
         }
-      }
+        return value!;
+      });
+      const fitted = nonDecreasingFit(wished);
+      layer.forEach((slot, index) => localAcross.set(slot.key, fitted[index] + offsets[at][index]));
+    };
+    const backwardOf = (key: string): string[] => backward.get(key) ?? [];
+    const forwardOf = (key: string): string[] => forward.get(key) ?? [];
+    for (let round = 0; round < 8; round++) {
+      for (let at = 1; at < layers.length; at++) settle(at, backwardOf);
+      for (let at = layers.length - 2; at >= 0; at--) settle(at, forwardOf);
     }
+    for (let at = 0; at < layers.length; at++) settle(at, (key) => [...backwardOf(key), ...forwardOf(key)]);
+    const start = Math.min(...localAcross.values());
+    for (const [key, value] of localAcross) across.set(key, round2(value - start));
+    const compBreadth = round2(Math.max(...layers.flat().map((slot) => across.get(slot.key)!)) + 1);
+    clusters.push({ id: clusterIndex, items: compItems, ranks: compRanks, breadth: compBreadth });
   }
 
-  // --- Place each slot across the flow: pull connected things into line --
-  const across = new Map<string, number>();
-  const offsets = layers.map((layer) => {
-    const offset = [0];
-    for (let index = 1; index < layer.length; index++) {
-      offset.push(offset[index - 1] + (layer[index - 1].room + layer[index].room) / 2 + SLOT_GAP[flow]);
-    }
-    return offset;
-  });
-  layers.forEach((layer, at) => {
-    const middle = (offsets[at][layer.length - 1] ?? 0) / 2;
-    layer.forEach((slot, index) => across.set(slot.key, offsets[at][index] - middle));
-  });
-  const settle = (at: number, neighbours: (key: string) => string[]): void => {
-    const layer = layers[at];
-    // How far each slot wants to move from its packed place. A slot with nothing to line up
-    // with has no wish of its own and stays packed against the nearest slot that has one.
-    const shift: (number | null)[] = layer.map((slot, index) => {
-      const near = neighbours(slot.key);
-      return near.length ? mean(near.map((key) => across.get(key)!)) - offsets[at][index] : null;
-    });
-    if (shift.every((value) => value === null)) return;
-    const wished = shift.map((value, index) => {
-      for (let distance = 0; value === null && distance < layer.length; distance++) {
-        value = shift[index - distance] ?? shift[index + distance] ?? null;
-      }
-      return value!;
-    });
-    const fitted = nonDecreasingFit(wished);
-    layer.forEach((slot, index) => across.set(slot.key, fitted[index] + offsets[at][index]));
-  };
-  const backwardOf = (key: string): string[] => backward.get(key) ?? [];
-  const forwardOf = (key: string): string[] => forward.get(key) ?? [];
-  for (let round = 0; round < 8; round++) {
-    for (let at = 1; at < layers.length; at++) settle(at, backwardOf);
-    for (let at = layers.length - 2; at >= 0; at--) settle(at, forwardOf);
-  }
-  for (let at = 0; at < layers.length; at++) settle(at, (key) => [...backwardOf(key), ...forwardOf(key)]);
-  const start = across.size === 0 ? 0 : Math.min(...across.values());
-  for (const [key, value] of across) across.set(key, round2(value - start));
-  const breadth = items.length === 0 ? 0 : round2(Math.max(...layers.flat().map((slot) => across.get(slot.key)!)) + 1);
+  const ranks = clusters.length > 0 ? Math.max(...clusters.map((c) => c.ranks)) : standalone.length > 0 ? 1 : 0;
+  const breadth = clusters.length > 0 ? round2(Math.max(...clusters.map((c) => c.breadth))) : standalone.length;
 
   // --- Nodes and the dots that stand for collapsed ones -------------------
   const nodes: GraphNode[] = kept.map((issue) => {
     const id = issue.identifier;
     const status = statusOf(id);
+    const drawnItem = itemOf(id);
     return {
       id,
       title: issue.title,
@@ -588,8 +649,9 @@ export function buildGraph(issues: LinearIssue[], options: { collapse?: Iterable
       dueDate: issue.dueDate ?? null,
       priority: issue.priority ?? 0,
       milestone: issue.projectMilestone?.id ?? NO_MILESTONE,
-      rank: rank.get(itemOf(id))!,
-      across: across.get(itemOf(id))!,
+      cluster: clusterOf.get(drawnItem)!,
+      rank: rank.get(drawnItem)!,
+      across: across.get(drawnItem)!,
       done: status === "done",
       blocked: status === "blocked",
       ready: status === "ready",
@@ -603,6 +665,7 @@ export function buildGraph(issues: LinearIssue[], options: { collapse?: Iterable
     id: group,
     status: group.slice("group:".length) as Status,
     members: ids.filter((id) => hidden.has(id) && groupOf(id) === group),
+    cluster: clusterOf.get(group)!,
     rank: rank.get(group)!,
     across: across.get(group)!,
   }));
@@ -616,6 +679,7 @@ export function buildGraph(issues: LinearIssue[], options: { collapse?: Iterable
       edges.push({
         from,
         to,
+        cluster: clusterOf.get(from)!,
         cyclic: cyclic.has(key),
         via: lines.get(key)!.via,
         points: [
@@ -659,6 +723,8 @@ export function buildGraph(issues: LinearIssue[], options: { collapse?: Iterable
     nodes,
     groups,
     edges,
+    clusters,
+    standalone,
     milestones: ordered,
     totals: {
       total: nodes.length,

@@ -124,19 +124,76 @@ test("nothing in a rank overlaps: cards are a full card apart, and passing lines
     issue(11),
   ];
   const graph = buildGraph(issues);
-  for (let rank = 0; rank < graph.ranks; rank++) {
-    const cards = graph.nodes.filter((entry) => entry.rank === rank).map((entry) => entry.across);
-    const lines = graph.edges.flatMap((edge) => edge.points.slice(1, -1).filter((point) => point[0] === rank).map((point) => point[1]));
-    const sorted = [...cards].sort((a, b) => a - b);
-    for (let index = 1; index < sorted.length; index++) {
-      assert.ok(sorted[index] - sorted[index - 1] >= 1, `cards in rank ${rank} are at least one card apart`);
+  assert.deepEqual(graph.standalone, ["T-10", "T-11"]);
+  assert.equal(graph.clusters.length, 1);
+  for (const cluster of graph.clusters) {
+    const clusterNodes = graph.nodes.filter((entry) => entry.cluster === cluster.id);
+    const clusterEdges = graph.edges.filter((edge) => edge.cluster === cluster.id);
+    for (let rank = 0; rank < cluster.ranks; rank++) {
+      const cards = clusterNodes.filter((entry) => entry.rank === rank).map((entry) => entry.across);
+      const lines = clusterEdges.flatMap((edge) => edge.points.slice(1, -1).filter((point) => point[0] === rank).map((point) => point[1]));
+      const sorted = [...cards].sort((a, b) => a - b);
+      for (let index = 1; index < sorted.length; index++) {
+        assert.ok(sorted[index] - sorted[index - 1] >= 1, `cards in rank ${rank} are at least one card apart`);
+      }
+      for (const line of lines) {
+        for (const card of cards) assert.ok(Math.abs(line - card) >= 0.55, `a line in rank ${rank} keeps clear of the cards`);
+      }
     }
-    for (const line of lines) {
-      for (const card of cards) assert.ok(Math.abs(line - card) >= 0.55, `a line in rank ${rank} keeps clear of the cards`);
-    }
+    assert.ok(Math.min(...clusterNodes.map((entry) => entry.across)) >= 0);
+    assert.ok(cluster.breadth >= Math.max(...clusterNodes.map((entry) => entry.across)) + 1);
   }
-  assert.ok(Math.min(...graph.nodes.map((entry) => entry.across)) >= 0);
-  assert.ok(graph.breadth >= Math.max(...graph.nodes.map((entry) => entry.across)) + 1);
+});
+
+test("disconnected chains become separate clusters sorted largest-first, and unlinked issues go to standalone", () => {
+  const m1 = { id: "m1", name: "First", sortOrder: 10 };
+  const m2 = { id: "m2", name: "Second", sortOrder: 20 };
+  const graph = buildGraph([
+    // 2-node chain
+    issue(1, { blocks: [2], milestone: m1 }),
+    issue(2, { milestone: m1 }),
+    // 3-node chain (should sort first as cluster 0)
+    issue(3, { blocks: [4], milestone: m2 }),
+    issue(4, { blocks: [5], milestone: m2 }),
+    issue(5, { milestone: m2 }),
+    // Standalone issues
+    issue(6, { milestone: m2 }),
+    issue(7, { milestone: m1 }),
+    issue(8),
+  ]);
+  assert.deepEqual(
+    graph.clusters.map((c) => ({ id: c.id, items: c.items, ranks: c.ranks })),
+    [
+      { id: 0, items: ["T-3", "T-4", "T-5"], ranks: 3 },
+      { id: 1, items: ["T-1", "T-2"], ranks: 2 },
+    ],
+  );
+  // Standalone sorted by milestone sortOrder then identifier.
+  assert.deepEqual(graph.standalone, ["T-7", "T-6", "T-8"]);
+  assert.equal(node(graph, 3).cluster, 0);
+  assert.equal(node(graph, 1).cluster, 1);
+  assert.equal(node(graph, 7).cluster, null);
+  // Every edge stays inside one cluster.
+  for (const edge of graph.edges) {
+    assert.equal(edge.cluster, graph.nodes.find((n) => n.id === edge.from)!.cluster);
+    assert.equal(edge.cluster, graph.nodes.find((n) => n.id === edge.to)!.cluster);
+  }
+});
+
+test("collapsed status dots sit in standalone when unlinked, or in their cluster when linked", () => {
+  const graph = buildGraph(
+    [
+      issue(1, { state: "completed", blocks: [2] }),
+      issue(2),
+      issue(3, { state: "started" }), // standalone started issue
+    ],
+    { collapse: ["done", "started"] },
+  );
+  assert.equal(graph.clusters.length, 1);
+  assert.deepEqual(graph.clusters[0].items, ["T-2", "group:done"]);
+  assert.deepEqual(graph.standalone, ["group:started"]);
+  assert.equal(graph.groups.find((g) => g.id === "group:done")!.cluster, 0);
+  assert.equal(graph.groups.find((g) => g.id === "group:started")!.cluster, null);
 });
 
 test("ready, blocked and done follow the state of the blocking issues", () => {
